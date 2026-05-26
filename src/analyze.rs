@@ -17,6 +17,7 @@ use crate::{
     ImportanceAggregation,
     ImportanceThresholdMode,
     SceneDetectionSpeed,
+    TransientSimilarityOptions,
     data::{
         motion::RefMEStats,
         plane::{downscale, downscale_in_place},
@@ -69,6 +70,8 @@ impl<T: Pixel> ScaleFunction<T> {
 pub(crate) struct ScenecutAnalysis {
     pub result: ScenecutResult,
     pub importance_blocks: Vec<f64>,
+    pub importance_cols: usize,
+    pub importance_rows: usize,
 }
 
 impl ScenecutAnalysis {
@@ -77,6 +80,8 @@ impl ScenecutAnalysis {
         Self {
             result,
             importance_blocks: Vec::new(),
+            importance_cols: 0,
+            importance_rows: 0,
         }
     }
 }
@@ -232,6 +237,16 @@ impl<T: Pixel> SceneChangeDetector<T> {
         input_frameno: usize,
         previous_keyframe: usize,
     ) -> (bool, Option<ScenecutResult>) {
+        self.analyze_next_frame_with_history(frame_set, &[], input_frameno, previous_keyframe)
+    }
+
+    pub(crate) fn analyze_next_frame_with_history(
+        &mut self,
+        frame_set: &[&Arc<Frame<T>>],
+        previous_frame_set: &[&Arc<Frame<T>>],
+        input_frameno: usize,
+        previous_keyframe: usize,
+    ) -> (bool, Option<ScenecutResult>) {
         // Use score deque for adaptive threshold for scene cut
         // Declare score_deque offset based on lookahead  for scene change scores
 
@@ -276,7 +291,8 @@ impl<T: Pixel> SceneChangeDetector<T> {
         }
 
         // Adaptive scenecut check
-        let (mut scenecut, mut score) = self.adaptive_scenecut(frame_set, input_frameno);
+        let (mut scenecut, mut score) =
+            self.adaptive_scenecut(frame_set, previous_frame_set, input_frameno);
         if let Some(interval_decision) = self.handle_min_max_intervals(distance) {
             scenecut = interval_decision;
             score.decision = if interval_decision {
@@ -411,6 +427,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
     fn adaptive_scenecut(
         &mut self,
         frame_set: &[&Arc<Frame<T>>],
+        previous_frame_set: &[&Arc<Frame<T>>],
         input_frameno: usize,
     ) -> (bool, ScenecutResult) {
         for idx in 0..self.score_deque.len() {
@@ -498,6 +515,17 @@ impl<T: Pixel> SceneChangeDetector<T> {
             scenecut = true;
         }
 
+        if scenecut
+            && matches!(score.decision, ScenecutDecision::CutImportance)
+            && let Some(delta) = self.two_sided_masked_similarity(previous_frame_set, frame_set)
+        {
+            score.transient_similarity_score = Some(delta);
+            if delta <= self.tuning.transient_similarity.threshold_8bit {
+                score.decision = ScenecutDecision::SuppressedTransientSimilarity;
+                scenecut = false;
+            }
+        }
+
         if scenecut && self.is_forward_suppressed(input_frameno) {
             score.decision = ScenecutDecision::SuppressedForwardSimilarity;
             scenecut = false;
@@ -526,15 +554,31 @@ impl<T: Pixel> SceneChangeDetector<T> {
         let Some(current) = self.score_deque.get(index).map(|analysis| analysis.result) else {
             return false;
         };
-        if current.imp_block_ratio < min_ratio
-            || current.imp_block_cost < current.imp_block_threshold
-            || current.cost_ratio < self.tuning.importance_cut_min_cost_ratio
-        {
+        if current.imp_block_cost < current.imp_block_threshold {
             return false;
         }
         if let Some(max_luma_8bit) = self.tuning.importance_cut_max_luma_8bit
             && current.avg_luma_8bit > max_luma_8bit
         {
+            return false;
+        }
+
+        let strict_passed = current.imp_block_ratio >= min_ratio
+            && current.cost_ratio >= self.tuning.importance_cut_min_cost_ratio;
+        let relaxed_passed = self
+            .tuning
+            .importance_cut_relaxed_ratio
+            .is_some_and(|ratio| {
+                let previous_ratio = self
+                    .score_deque
+                    .get(index + 1)
+                    .map_or(0.0, |analysis| analysis.result.imp_block_ratio);
+                current.imp_block_ratio >= ratio
+                    && current.cost_ratio >= self.tuning.importance_cut_relaxed_min_cost_ratio
+                    && previous_ratio <= self.tuning.importance_cut_relaxed_max_previous_ratio
+                    && current.me_bad_block_ratio >= self.tuning.importance_cut_min_me_bad_ratio
+            });
+        if !strict_passed && !relaxed_passed {
             return false;
         }
 
@@ -561,6 +605,22 @@ impl<T: Pixel> SceneChangeDetector<T> {
                     previous_percent,
                     current_percent,
                     next_percent,
+                )
+                .unwrap_or(analysis.result.imp_block_cost_raw),
+            ImportanceAggregation::SpatialTemporalTopBlocks {
+                previous_percent,
+                current_percent,
+                next_percent,
+                region_cols,
+                region_rows,
+            } => self
+                .temporal_top_importance_score_spatially_capped(
+                    index,
+                    previous_percent,
+                    current_percent,
+                    next_percent,
+                    region_cols,
+                    region_rows,
                 )
                 .unwrap_or(analysis.result.imp_block_cost_raw),
         };
@@ -595,6 +655,68 @@ impl<T: Pixel> SceneChangeDetector<T> {
             && let Some(next) = self.score_deque.get(index - 1)
         {
             mark_top_blocks(&next.importance_blocks, next_percent, &mut selected);
+        }
+
+        let mut total = 0.0;
+        let mut selected_count = 0usize;
+        for (idx, &is_selected) in selected.iter().enumerate() {
+            if is_selected {
+                total += current.importance_blocks[idx];
+                selected_count += 1;
+            }
+        }
+
+        (selected_count > 0).then_some(total / selected_count as f64)
+    }
+
+    fn temporal_top_importance_score_spatially_capped(
+        &self,
+        index: usize,
+        previous_percent: f64,
+        current_percent: f64,
+        next_percent: f64,
+        region_cols: usize,
+        region_rows: usize,
+    ) -> Option<f64> {
+        let current = self.score_deque.get(index)?;
+        let block_count = current.importance_blocks.len();
+        if block_count == 0 || current.importance_cols == 0 || current.importance_rows == 0 {
+            return None;
+        }
+
+        let mut selected = vec![false; block_count];
+        if let Some(previous) = self.score_deque.get(index + 1) {
+            mark_top_blocks_spatially_capped(
+                &previous.importance_blocks,
+                previous_percent,
+                current.importance_cols,
+                current.importance_rows,
+                region_cols,
+                region_rows,
+                &mut selected,
+            );
+        }
+        mark_top_blocks_spatially_capped(
+            &current.importance_blocks,
+            current_percent,
+            current.importance_cols,
+            current.importance_rows,
+            region_cols,
+            region_rows,
+            &mut selected,
+        );
+        if index > 0
+            && let Some(next) = self.score_deque.get(index - 1)
+        {
+            mark_top_blocks_spatially_capped(
+                &next.importance_blocks,
+                next_percent,
+                current.importance_cols,
+                current.importance_rows,
+                region_cols,
+                region_rows,
+                &mut selected,
+            );
         }
 
         let mut total = 0.0;
@@ -665,6 +787,92 @@ impl<T: Pixel> SceneChangeDetector<T> {
         None
     }
 
+    fn two_sided_masked_similarity(
+        &self,
+        previous_frame_set: &[&Arc<Frame<T>>],
+        frame_set: &[&Arc<Frame<T>>],
+    ) -> Option<f64> {
+        let TransientSimilarityOptions {
+            enabled,
+            frames,
+            mask_percent,
+            ..
+        } = self.tuning.transient_similarity;
+        if !enabled || frames == 0 || previous_frame_set.is_empty() || frame_set.len() < 2 {
+            return None;
+        }
+
+        let pre_start = previous_frame_set.len().saturating_sub(frames);
+        let post_count = frames.min(frame_set.len().saturating_sub(1));
+        let mut best = f64::MAX;
+        for pre_frame in &previous_frame_set[pre_start..] {
+            for post_frame in frame_set.iter().skip(1).take(post_count) {
+                let delta = self.masked_luma_delta_8bit(pre_frame, post_frame, mask_percent);
+                if delta < best {
+                    best = delta;
+                }
+            }
+        }
+
+        best.is_finite().then_some(best)
+    }
+
+    fn masked_luma_delta_8bit(
+        &self,
+        frame1: &Arc<Frame<T>>,
+        frame2: &Arc<Frame<T>>,
+        mask_percent: f64,
+    ) -> f64 {
+        const BLOCK_SIZE: usize = 32;
+        const SAMPLE_STEP: usize = 4;
+
+        let plane1 = &frame1.y_plane;
+        let plane2 = &frame2.y_plane;
+        let width = plane1.width().get().min(plane2.width().get());
+        let height = plane1.height().get().min(plane2.height().get());
+        let cols = width / BLOCK_SIZE;
+        let rows = height / BLOCK_SIZE;
+        if cols == 0 || rows == 0 {
+            return self.luma_delta_8bit(frame1, frame2);
+        }
+
+        let stride1 = plane1.geometry().stride.get();
+        let stride2 = plane2.geometry().stride.get();
+        let origin1 = plane1.data_origin();
+        let origin2 = plane2.data_origin();
+        let data1 = plane1.data();
+        let data2 = plane2.data();
+        let scale = sample_range_scale(self.bit_depth);
+        let mut block_deltas = Vec::with_capacity(cols * rows);
+
+        for by in 0..rows {
+            for bx in 0..cols {
+                let mut total = 0.0;
+                let mut count = 0usize;
+                let y_base = by * BLOCK_SIZE;
+                let x_base = bx * BLOCK_SIZE;
+                for y in (y_base..y_base + BLOCK_SIZE).step_by(SAMPLE_STEP) {
+                    for x in (x_base..x_base + BLOCK_SIZE).step_by(SAMPLE_STEP) {
+                        let idx1 = origin1 + y * stride1 + x;
+                        let idx2 = origin2 + y * stride2 + x;
+                        let p1 = data1[idx1].to_u16().expect("pixel value should fit in u16");
+                        let p2 = data2[idx2].to_u16().expect("pixel value should fit in u16");
+                        total += (p1 as f64 - p2 as f64).abs();
+                        count += 1;
+                    }
+                }
+                block_deltas.push(total / count as f64 / scale);
+            }
+        }
+
+        block_deltas.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let keep = ((block_deltas.len() as f64 * (1.0 - mask_percent.clamp(0.0, 0.95))).ceil()
+            as usize)
+            .max(1)
+            .min(block_deltas.len());
+        block_deltas.iter().take(keep).sum::<f64>() / keep as f64
+    }
+
     fn luma_delta_8bit(&self, frame1: &Arc<Frame<T>>, frame2: &Arc<Frame<T>>) -> f64 {
         let pixels = frame1.y_plane.width().get() * frame1.y_plane.height().get();
         if pixels == 0 {
@@ -701,6 +909,63 @@ fn mark_top_blocks(source: &[f64], percent: f64, selected: &mut [bool]) {
     }
 }
 
+fn mark_top_blocks_spatially_capped(
+    source: &[f64],
+    percent: f64,
+    block_cols: usize,
+    block_rows: usize,
+    region_cols: usize,
+    region_rows: usize,
+    selected: &mut [bool],
+) {
+    if source.is_empty()
+        || selected.is_empty()
+        || percent <= 0.0
+        || block_cols == 0
+        || block_rows == 0
+        || region_cols == 0
+        || region_rows == 0
+    {
+        return;
+    }
+
+    let target = ((source.len() as f64 * percent).ceil() as usize)
+        .max(1)
+        .min(source.len());
+    let region_count = region_cols * region_rows;
+    let per_region_cap = target.div_ceil(region_count).max(1);
+
+    for region_y in 0..region_rows {
+        let y_start = region_y * block_rows / region_rows;
+        let y_end = ((region_y + 1) * block_rows / region_rows).min(block_rows);
+        for region_x in 0..region_cols {
+            let x_start = region_x * block_cols / region_cols;
+            let x_end = ((region_x + 1) * block_cols / region_cols).min(block_cols);
+            let mut indices = Vec::new();
+            for y in y_start..y_end {
+                for x in x_start..x_end {
+                    let idx = y * block_cols + x;
+                    if idx < source.len() {
+                        indices.push(idx);
+                    }
+                }
+            }
+
+            indices.sort_unstable_by(|&a, &b| {
+                source[b]
+                    .partial_cmp(&source[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            for idx in indices.into_iter().take(per_region_cap) {
+                if let Some(slot) = selected.get_mut(idx) {
+                    *slot = true;
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[allow(missing_docs)]
@@ -714,6 +979,7 @@ pub enum ScenecutDecision {
     SuppressedMinDistance,
     ForcedMaxDistance,
     SuppressedForwardSimilarity,
+    SuppressedTransientSimilarity,
 }
 
 /// Contains the scores for scenecut analysis on a single frame
@@ -731,6 +997,9 @@ pub struct ScenecutResult {
     pub threshold: f64,
     pub cost_ratio: f64,
     pub avg_luma_8bit: f64,
+    pub me_bad_block_ratio: f64,
+    pub me_good_block_ratio: f64,
+    pub transient_similarity_score: Option<f64>,
     pub decision: ScenecutDecision,
     pub forward_return_frame: Option<usize>,
 }
@@ -755,6 +1024,9 @@ impl ScenecutResult {
             threshold,
             cost_ratio: 0.0,
             avg_luma_8bit,
+            me_bad_block_ratio: 0.0,
+            me_good_block_ratio: 0.0,
+            transient_similarity_score: None,
             decision: ScenecutDecision::NotEvaluated,
             forward_return_frame: None,
         };

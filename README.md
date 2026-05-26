@@ -28,11 +28,20 @@ adds opt-in tuning:
   current comparison, and top 10% from the next comparison. This keeps localized
   scene changes from being diluted by dark or static background regions while
   avoiding a purely single-frame top-percentile decision.
+- High mode uses spatially capped temporal top-block aggregation, limiting how
+  many selected blocks can come from the same screen region so a local flash or
+  beam cannot dominate the importance score by itself.
 - Strong local importance peaks can become cuts in high mode even when the
   motion/intra cost ratio stays below the normal threshold. This is intended
   for dark-to-dark HDR cuts where the legacy cost threshold can remain too high.
   This path is constrained to dark frames with some cost-ratio evidence so fast
   motion in normal-brightness scenes does not create clusters of false cuts.
+- Importance-driven cuts can be suppressed by two-sided masked similarity:
+  av-scenechange compares frames before and after the candidate while masking
+  the most volatile blocks. This suppresses transient flashes where the stable
+  background remains similar across the candidate boundary.
+- Motion-estimation residual coverage is exposed as bad/good block ratios and
+  used as additional evidence for relaxed dark-scene importance cuts.
 - Per-frame diagnostics in `ScenecutResult`, including cost ratios,
   importance ratios, luma, decision reason, and forward-similarity suppression
   metadata.

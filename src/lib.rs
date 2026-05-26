@@ -109,9 +109,19 @@ impl DetectionOptions {
             1
         };
         if self.tuning.forward_similarity.enabled {
-            flash_lookahead.max(self.tuning.forward_similarity.frames)
-        } else {
             flash_lookahead
+                .max(self.tuning.forward_similarity.frames)
+                .max(if self.tuning.transient_similarity.enabled {
+                    self.tuning.transient_similarity.frames
+                } else {
+                    0
+                })
+        } else {
+            flash_lookahead.max(if self.tuning.transient_similarity.enabled {
+                self.tuning.transient_similarity.frames
+            } else {
+                0
+            })
         }
     }
 }
@@ -144,8 +154,18 @@ pub struct DetectionTuning {
     pub importance_cut_min_cost_ratio: f64,
     /// Optional maximum luma, in 8-bit units, for importance-driven cuts.
     pub importance_cut_max_luma_8bit: Option<f64>,
+    /// Lower importance ratio accepted when a cut starts after quiet blocks.
+    pub importance_cut_relaxed_ratio: Option<f64>,
+    /// Lower cost-ratio accepted for abrupt dark-scene importance cuts.
+    pub importance_cut_relaxed_min_cost_ratio: f64,
+    /// Previous-frame importance ratio required for relaxed abrupt cuts.
+    pub importance_cut_relaxed_max_previous_ratio: f64,
+    /// Minimum ME residual coverage that can support relaxed cuts.
+    pub importance_cut_min_me_bad_ratio: f64,
     /// Optional A-B-A transient suppression.
     pub forward_similarity: ForwardSimilarityOptions,
+    /// Optional two-sided masked similarity suppression for transient cuts.
+    pub transient_similarity: TransientSimilarityOptions,
 }
 
 impl Default for DetectionTuning {
@@ -163,7 +183,12 @@ impl Default for DetectionTuning {
             importance_cut_ratio: None,
             importance_cut_min_cost_ratio: 0.0,
             importance_cut_max_luma_8bit: None,
+            importance_cut_relaxed_ratio: None,
+            importance_cut_relaxed_min_cost_ratio: 0.0,
+            importance_cut_relaxed_max_previous_ratio: 2.2,
+            importance_cut_min_me_bad_ratio: 0.0,
             forward_similarity: ForwardSimilarityOptions::default(),
+            transient_similarity: TransientSimilarityOptions::default(),
         }
     }
 }
@@ -177,20 +202,32 @@ impl DetectionTuning {
             fast_threshold_scale: FastThresholdScale::SampleRange,
             importance_mode: ImportanceThresholdMode::AdaptiveLuma,
             importance_min_factor: 0.35,
-            importance_aggregation: ImportanceAggregation::TemporalTopBlocks {
+            importance_aggregation: ImportanceAggregation::SpatialTemporalTopBlocks {
                 previous_percent: 0.10,
                 current_percent: 0.15,
                 next_percent: 0.10,
+                region_cols: 8,
+                region_rows: 4,
             },
             strong_cut_ratio: Some(2.5),
             importance_cut_ratio: Some(3.2),
             importance_cut_min_cost_ratio: 0.20,
             importance_cut_max_luma_8bit: Some(60.0),
+            importance_cut_relaxed_ratio: Some(3.0),
+            importance_cut_relaxed_min_cost_ratio: 0.08,
+            importance_cut_relaxed_max_previous_ratio: 2.2,
+            importance_cut_min_me_bad_ratio: 0.15,
             forward_similarity: ForwardSimilarityOptions {
                 enabled: true,
                 frames: 24,
                 threshold_8bit: 6.0,
                 suppress_inside: true,
+            },
+            transient_similarity: TransientSimilarityOptions {
+                enabled: true,
+                frames: 10,
+                threshold_8bit: 6.0,
+                mask_percent: 0.20,
             },
             ..DetectionTuning::default()
         }
@@ -233,6 +270,20 @@ pub enum ImportanceAggregation {
         /// Fraction of top next-comparison blocks to reuse.
         next_percent: f64,
     },
+    /// Select top temporal blocks with a cap per spatial region so localized
+    /// flashes cannot dominate the score.
+    SpatialTemporalTopBlocks {
+        /// Fraction of top previous-comparison blocks to reuse.
+        previous_percent: f64,
+        /// Fraction of top current-comparison blocks to use.
+        current_percent: f64,
+        /// Fraction of top next-comparison blocks to reuse.
+        next_percent: f64,
+        /// Number of horizontal spatial regions.
+        region_cols: usize,
+        /// Number of vertical spatial regions.
+        region_rows: usize,
+    },
 }
 
 /// Options for suppressing short A-B-A transient cuts.
@@ -258,6 +309,33 @@ impl Default for ForwardSimilarityOptions {
             frames: 0,
             threshold_8bit: 6.0,
             suppress_inside: false,
+        }
+    }
+}
+
+/// Options for suppressing transient flash/local-motion cuts by comparing
+/// masked frames before and after the candidate cut.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+pub struct TransientSimilarityOptions {
+    /// Enable two-sided masked similarity suppression.
+    pub enabled: bool,
+    /// Number of frames to inspect on each side of the candidate.
+    pub frames: usize,
+    /// Maximum masked luma delta, in 8-bit units, considered the same scene.
+    pub threshold_8bit: f64,
+    /// Fraction of most volatile blocks to mask from the similarity score.
+    pub mask_percent: f64,
+}
+
+impl Default for TransientSimilarityOptions {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            frames: 0,
+            threshold_8bit: 6.0,
+            mask_percent: 0.20,
         }
     }
 }
@@ -332,6 +410,11 @@ pub fn detect_scene_changes<T: Pixel>(
     progress_callback: Option<&dyn Fn(usize, usize)>,
 ) -> anyhow::Result<DetectionResults> {
     let effective_lookahead = opts.effective_lookahead_distance();
+    let transient_history = if opts.tuning.transient_similarity.enabled {
+        opts.tuning.transient_similarity.frames
+    } else {
+        0
+    };
     assert!(effective_lookahead >= 1);
 
     let detector = new_detector::<T>(dec, opts)?;
@@ -370,8 +453,10 @@ pub fn detect_scene_changes<T: Pixel>(
                     }
                 }
 
+                let frame_set_start = frameno.saturating_sub(1);
                 let frame_set = frame_queue
-                    .values()
+                    .range(frame_set_start..)
+                    .map(|(_, frame)| frame)
                     .take(effective_lookahead + 2)
                     .collect::<Vec<_>>();
                 if frame_set.len() < 2 {
@@ -380,8 +465,13 @@ pub fn detect_scene_changes<T: Pixel>(
                 if frameno == 0 {
                     keyframes.insert(frameno);
                 } else {
-                    let (cut, score) = detector.analyze_next_frame(
+                    let previous_frame_set = frame_queue
+                        .range(frameno.saturating_sub(transient_history + 1)..frameno)
+                        .map(|(_, frame)| frame)
+                        .collect::<Vec<_>>();
+                    let (cut, score) = detector.analyze_next_frame_with_history(
                         &frame_set,
+                        &previous_frame_set,
                         frameno,
                         *keyframes
                             .iter()
@@ -396,8 +486,17 @@ pub fn detect_scene_changes<T: Pixel>(
                     }
                 }
 
-                if frameno > 0 {
-                    frame_queue.remove(&(frameno - 1));
+                let remove_before = frameno.saturating_sub(transient_history + 1);
+                while frame_queue
+                    .keys()
+                    .next()
+                    .is_some_and(|&oldest| oldest < remove_before)
+                {
+                    let oldest = *frame_queue
+                        .keys()
+                        .next()
+                        .expect("oldest frame should exist");
+                    frame_queue.remove(&oldest);
                 }
 
                 frameno += 1;

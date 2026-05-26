@@ -53,6 +53,13 @@ use crate::{
     math::{ILog, clamp},
 };
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InterCostEstimate {
+    pub mean: f64,
+    pub me_bad_block_ratio: f64,
+    pub me_good_block_ratio: f64,
+}
+
 /// Declares an array of motion vectors in structure of arrays syntax.
 macro_rules! search_pattern_subpel {
     ($field_a:ident: [$($ll_a:expr),*], $field_b:ident: [$($ll_b:expr),*]) => {
@@ -160,6 +167,7 @@ const SQUARE_REFINE_PATTERN: [MotionVector; 8] = search_pattern!(
 
 #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
 #[doc(hidden)]
+#[allow(dead_code)]
 #[allow(clippy::missing_inline_in_public_items)]
 pub fn estimate_inter_costs<T: Pixel>(
     frame: &Arc<Frame<T>>,
@@ -169,6 +177,25 @@ pub fn estimate_inter_costs<T: Pixel>(
     chroma_sampling: ChromaSubsampling,
     buffer: RefMEStats,
 ) -> f64 {
+    estimate_inter_costs_detailed(
+        frame,
+        ref_frame,
+        bit_depth,
+        frame_rate,
+        chroma_sampling,
+        buffer,
+    )
+    .mean
+}
+
+pub fn estimate_inter_costs_detailed<T: Pixel>(
+    frame: &Arc<Frame<T>>,
+    ref_frame: &Arc<Frame<T>>,
+    bit_depth: usize,
+    frame_rate: Rational32,
+    chroma_sampling: ChromaSubsampling,
+    buffer: RefMEStats,
+) -> InterCostEstimate {
     let last_fi =
         FrameInvariants::new_key_frame(frame.y_plane.width().get(), frame.y_plane.height().get());
     #[expect(clippy::unwrap_used)]
@@ -195,6 +222,7 @@ pub fn estimate_inter_costs<T: Pixel>(
     let bsize = BlockSize::from_width_and_height(IMPORTANCE_BLOCK_SIZE, IMPORTANCE_BLOCK_SIZE);
 
     let mut inter_costs = 0;
+    let mut block_costs = Vec::with_capacity(w_in_imp_b * h_in_imp_b);
     (0..h_in_imp_b).for_each(|y| {
         (0..w_in_imp_b).for_each(|x| {
             let mv = stats[y * 2][x * 2].mv;
@@ -218,16 +246,38 @@ pub fn estimate_inter_costs<T: Pixel>(
                 height: IMPORTANCE_BLOCK_SIZE,
             }));
 
-            inter_costs += get_satd(
+            let block_cost = get_satd(
                 &region_org,
                 &region_ref,
                 bsize.width(),
                 bsize.height(),
                 bit_depth,
             ) as u64;
+            inter_costs += block_cost;
+            block_costs.push(block_cost as f64);
         });
     });
-    inter_costs as f64 / (w_in_imp_b * h_in_imp_b) as f64
+
+    let block_count = w_in_imp_b * h_in_imp_b;
+    let mean = inter_costs as f64 / block_count as f64;
+    let bad_threshold = mean * 0.75;
+    let good_threshold = mean * 0.25;
+    let me_bad_block_ratio = block_costs
+        .iter()
+        .filter(|&&cost| cost >= bad_threshold)
+        .count() as f64
+        / block_count as f64;
+    let me_good_block_ratio = block_costs
+        .iter()
+        .filter(|&&cost| cost <= good_threshold)
+        .count() as f64
+        / block_count as f64;
+
+    InterCostEstimate {
+        mean,
+        me_bad_block_ratio,
+        me_good_block_ratio,
+    }
 }
 
 #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]

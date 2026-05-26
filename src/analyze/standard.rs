@@ -6,7 +6,7 @@ use super::{SceneChangeDetector, ScenecutAnalysis, ScenecutResult};
 use crate::{
     analyze::{
         importance::estimate_importance_block_difference_detailed,
-        inter::estimate_inter_costs,
+        inter::estimate_inter_costs_detailed,
         intra::estimate_intra_costs,
     },
     data::motion::FrameMEStats,
@@ -31,7 +31,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
         input_frameno: usize,
     ) -> ScenecutAnalysis {
         let mut intra_cost = 0.0;
-        let mut mv_inter_cost = 0.0;
+        let mut mv_inter_cost = None;
         let mut imp_block_diff = None;
 
         let cols = 2 * self.resolution.0.align_power_of_two_and_shift(3);
@@ -61,14 +61,14 @@ impl<T: Pixel> SceneChangeDetector<T> {
                     / intra_costs.len() as f64;
             });
             s.spawn(|_| {
-                mv_inter_cost = estimate_inter_costs(
+                mv_inter_cost = Some(estimate_inter_costs_detailed(
                     frame2,
                     frame1,
                     self.bit_depth,
                     self.frame_rate,
                     self.chroma_sampling,
                     buffer,
-                );
+                ));
             });
             s.spawn(|_| {
                 imp_block_diff = Some(estimate_importance_block_difference_detailed(
@@ -87,16 +87,23 @@ impl<T: Pixel> SceneChangeDetector<T> {
         const BIAS: f64 = 0.7;
         let threshold = intra_cost * (1.0 - BIAS);
         let imp_block_diff = imp_block_diff.expect("importance block diff should be set");
+        let mv_inter_cost = mv_inter_cost.expect("inter cost should be set");
+
+        let mut result = ScenecutResult::new(
+            mv_inter_cost.mean,
+            imp_block_diff.mean,
+            self.importance_threshold(imp_block_diff.avg_luma_8bit),
+            threshold,
+            imp_block_diff.avg_luma_8bit,
+        );
+        result.me_bad_block_ratio = mv_inter_cost.me_bad_block_ratio;
+        result.me_good_block_ratio = mv_inter_cost.me_good_block_ratio;
 
         ScenecutAnalysis {
-            result: ScenecutResult::new(
-                mv_inter_cost,
-                imp_block_diff.mean,
-                self.importance_threshold(imp_block_diff.avg_luma_8bit),
-                threshold,
-                imp_block_diff.avg_luma_8bit,
-            ),
+            result,
             importance_blocks: imp_block_diff.blocks,
+            importance_cols: imp_block_diff.cols,
+            importance_rows: imp_block_diff.rows,
         }
     }
 }

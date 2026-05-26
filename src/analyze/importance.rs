@@ -21,6 +21,8 @@ pub(crate) struct ImportanceBlockDiff {
     pub mean: f64,
     pub avg_luma_8bit: f64,
     pub blocks: Vec<f64>,
+    pub cols: usize,
+    pub rows: usize,
 }
 
 #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -50,6 +52,8 @@ pub(crate) fn estimate_importance_block_difference_detailed<T: Pixel>(
             mean: 0.0,
             avg_luma_8bit: 0.0,
             blocks: Vec::new(),
+            cols: 0,
+            rows: 0,
         };
     }
 
@@ -86,6 +90,8 @@ pub(crate) fn estimate_importance_block_difference_detailed<T: Pixel>(
         mean: imp_block_costs as f64 / block_count as f64,
         avg_luma_8bit,
         blocks,
+        cols: w_in_imp_b,
+        rows: h_in_imp_b,
     }
 }
 
