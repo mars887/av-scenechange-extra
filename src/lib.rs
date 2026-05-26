@@ -720,7 +720,10 @@ fn forward_similarity_postprocess_match(
                 && candidate.frame > frame
         })
         .filter_map(|candidate| {
-            let search_start = frame + min_offset;
+            let search_start = frame + min_offset - 1;
+            if search_start > candidate.frame {
+                return None;
+            }
             let return_candidate_frame = scores
                 .range(search_start..=candidate.frame)
                 .rev()
