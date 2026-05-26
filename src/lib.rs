@@ -156,6 +156,15 @@ pub struct DetectionTuning {
     pub importance_cut_max_luma_8bit: Option<f64>,
     /// Lower importance ratio accepted when a cut starts after quiet blocks.
     pub importance_cut_relaxed_ratio: Option<f64>,
+    /// Maximum amount subtracted from relaxed importance ratio in dark scenes.
+    pub importance_cut_dark_ratio_boost: f64,
+    /// Lowest relaxed importance ratio after dark-scene adaptation.
+    pub importance_cut_dark_min_ratio: f64,
+    /// Luma where dark-scene relaxed threshold adaptation reaches full
+    /// strength.
+    pub importance_cut_dark_luma_low_8bit: f64,
+    /// Luma where dark-scene relaxed threshold adaptation is disabled.
+    pub importance_cut_dark_luma_high_8bit: f64,
     /// Lower cost-ratio accepted for abrupt dark-scene importance cuts.
     pub importance_cut_relaxed_min_cost_ratio: f64,
     /// Previous-frame importance ratio required for relaxed abrupt cuts.
@@ -184,6 +193,10 @@ impl Default for DetectionTuning {
             importance_cut_min_cost_ratio: 0.0,
             importance_cut_max_luma_8bit: None,
             importance_cut_relaxed_ratio: None,
+            importance_cut_dark_ratio_boost: 0.0,
+            importance_cut_dark_min_ratio: 0.0,
+            importance_cut_dark_luma_low_8bit: 25.0,
+            importance_cut_dark_luma_high_8bit: 60.0,
             importance_cut_relaxed_min_cost_ratio: 0.0,
             importance_cut_relaxed_max_previous_ratio: 2.2,
             importance_cut_min_me_bad_ratio: 0.0,
@@ -214,19 +227,27 @@ impl DetectionTuning {
             importance_cut_min_cost_ratio: 0.20,
             importance_cut_max_luma_8bit: Some(60.0),
             importance_cut_relaxed_ratio: Some(3.0),
+            importance_cut_dark_ratio_boost: 0.65,
+            importance_cut_dark_min_ratio: 2.35,
+            importance_cut_dark_luma_low_8bit: 25.0,
+            importance_cut_dark_luma_high_8bit: 60.0,
             importance_cut_relaxed_min_cost_ratio: 0.08,
             importance_cut_relaxed_max_previous_ratio: 2.2,
             importance_cut_min_me_bad_ratio: 0.15,
             forward_similarity: ForwardSimilarityOptions {
                 enabled: true,
-                frames: 24,
+                frames: 60,
                 threshold_8bit: 6.0,
+                mask_percent: 0.20,
                 suppress_inside: true,
             },
             transient_similarity: TransientSimilarityOptions {
                 enabled: true,
                 frames: 10,
                 threshold_8bit: 6.0,
+                dark_threshold_8bit: 4.0,
+                dark_luma_low_8bit: 25.0,
+                dark_luma_high_8bit: 60.0,
                 mask_percent: 0.20,
             },
             ..DetectionTuning::default()
@@ -294,9 +315,11 @@ pub struct ForwardSimilarityOptions {
     pub enabled: bool,
     /// Number of future frames to inspect.
     pub frames: usize,
-    /// Maximum full-frame luma delta, in 8-bit units, considered a return to
-    /// the previous scene.
+    /// Maximum luma delta, in 8-bit units, considered a return to the previous
+    /// scene. Uses masked block comparison when `mask_percent` is non-zero.
     pub threshold_8bit: f64,
+    /// Fraction of most volatile blocks to mask when checking the return.
+    pub mask_percent: f64,
     /// Suppress additional cuts until the detected return frame.
     pub suppress_inside: bool,
 }
@@ -308,6 +331,7 @@ impl Default for ForwardSimilarityOptions {
             enabled: false,
             frames: 0,
             threshold_8bit: 6.0,
+            mask_percent: 0.0,
             suppress_inside: false,
         }
     }
@@ -324,6 +348,13 @@ pub struct TransientSimilarityOptions {
     pub frames: usize,
     /// Maximum masked luma delta, in 8-bit units, considered the same scene.
     pub threshold_8bit: f64,
+    /// Dark-scene threshold. Lower values avoid suppressing true dark cuts
+    /// whose backgrounds are naturally similar after masking.
+    pub dark_threshold_8bit: f64,
+    /// Luma where dark-scene threshold adaptation reaches full strength.
+    pub dark_luma_low_8bit: f64,
+    /// Luma where dark-scene threshold adaptation is disabled.
+    pub dark_luma_high_8bit: f64,
     /// Fraction of most volatile blocks to mask from the similarity score.
     pub mask_percent: f64,
 }
@@ -335,6 +366,9 @@ impl Default for TransientSimilarityOptions {
             enabled: false,
             frames: 0,
             threshold_8bit: 6.0,
+            dark_threshold_8bit: 6.0,
+            dark_luma_low_8bit: 25.0,
+            dark_luma_high_8bit: 60.0,
             mask_percent: 0.20,
         }
     }

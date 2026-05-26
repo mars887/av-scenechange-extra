@@ -30,16 +30,25 @@ adds opt-in tuning:
   avoiding a purely single-frame top-percentile decision.
 - High mode uses spatially capped temporal top-block aggregation, limiting how
   many selected blocks can come from the same screen region so a local flash or
-  beam cannot dominate the importance score by itself.
+  beam cannot dominate the importance score by itself. The uncapped temporal
+  score is also kept as `global_imp_block_cost` /
+  `global_imp_block_ratio` diagnostics so dark-scene misses can be separated
+  from over-aggressive spatial capping.
 - Strong local importance peaks can become cuts in high mode even when the
   motion/intra cost ratio stays below the normal threshold. This is intended
   for dark-to-dark HDR cuts where the legacy cost threshold can remain too high.
-  This path is constrained to dark frames with some cost-ratio evidence so fast
-  motion in normal-brightness scenes does not create clusters of false cuts.
+  This path uses a smooth luma-based relaxed threshold instead of a hard dark
+  luma cutoff, so the required importance ratio is lowered gradually as the
+  frame gets darker.
 - Importance-driven cuts can be suppressed by two-sided masked similarity:
   av-scenechange compares frames before and after the candidate while masking
   the most volatile blocks. This suppresses transient flashes where the stable
-  background remains similar across the candidate boundary.
+  background remains similar across the candidate boundary. The suppression
+  threshold is also luma-adaptive so dark scenes are less likely to lose real
+  cuts just because masked backgrounds are naturally similar.
+- Forward similarity now looks farther ahead in high mode and can use masked
+  comparison to suppress short A-B-A returns as one transient segment instead
+  of cutting around the short middle scene.
 - Motion-estimation residual coverage is exposed as bad/good block ratios and
   used as additional evidence for relaxed dark-scene importance cuts.
 - Per-frame diagnostics in `ScenecutResult`, including cost ratios,

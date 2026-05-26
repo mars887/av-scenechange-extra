@@ -447,7 +447,10 @@ impl<T: Pixel> SceneChangeDetector<T> {
         // algorithm.
         let importance_gate_passed = self.score_deque[self.deque_offset..]
             .iter()
-            .any(|analysis| analysis.result.imp_block_cost >= analysis.result.imp_block_threshold);
+            .any(|analysis| {
+                analysis.result.imp_block_cost >= analysis.result.imp_block_threshold
+                    || analysis.result.global_imp_block_cost >= analysis.result.imp_block_threshold
+            });
         let strong_cut_gate_passed = self
             .tuning
             .strong_cut_ratio
@@ -520,7 +523,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
             && let Some(delta) = self.two_sided_masked_similarity(previous_frame_set, frame_set)
         {
             score.transient_similarity_score = Some(delta);
-            if delta <= self.tuning.transient_similarity.threshold_8bit {
+            if delta <= self.transient_similarity_threshold(score.avg_luma_8bit) {
                 score.decision = ScenecutDecision::SuppressedTransientSimilarity;
                 scenecut = false;
             }
@@ -554,7 +557,9 @@ impl<T: Pixel> SceneChangeDetector<T> {
         let Some(current) = self.score_deque.get(index).map(|analysis| analysis.result) else {
             return false;
         };
-        if current.imp_block_cost < current.imp_block_threshold {
+        if current.imp_block_cost < current.imp_block_threshold
+            && current.global_imp_block_cost < current.imp_block_threshold
+        {
             return false;
         }
         if let Some(max_luma_8bit) = self.tuning.importance_cut_max_luma_8bit
@@ -569,11 +574,15 @@ impl<T: Pixel> SceneChangeDetector<T> {
             .tuning
             .importance_cut_relaxed_ratio
             .is_some_and(|ratio| {
+                let ratio = self.dark_adapted_relaxed_ratio(current.avg_luma_8bit, ratio);
                 let previous_ratio = self
                     .score_deque
                     .get(index + 1)
                     .map_or(0.0, |analysis| analysis.result.imp_block_ratio);
-                current.imp_block_ratio >= ratio
+                let spatial_passed = current.imp_block_ratio >= ratio;
+                let global_passed = current.global_imp_block_ratio >= ratio + 0.35
+                    && current.imp_block_ratio >= ratio * 0.75;
+                (spatial_passed || global_passed)
                     && current.cost_ratio >= self.tuning.importance_cut_relaxed_min_cost_ratio
                     && previous_ratio <= self.tuning.importance_cut_relaxed_max_previous_ratio
                     && current.me_bad_block_ratio >= self.tuning.importance_cut_min_me_bad_ratio
@@ -592,6 +601,27 @@ impl<T: Pixel> SceneChangeDetector<T> {
     fn refresh_importance_metrics(&mut self, index: usize) {
         let Some(analysis) = self.score_deque.get(index) else {
             return;
+        };
+        let global_imp_block_cost = match self.tuning.importance_aggregation {
+            ImportanceAggregation::TemporalTopBlocks {
+                previous_percent,
+                current_percent,
+                next_percent,
+            }
+            | ImportanceAggregation::SpatialTemporalTopBlocks {
+                previous_percent,
+                current_percent,
+                next_percent,
+                ..
+            } => self
+                .temporal_top_importance_score(
+                    index,
+                    previous_percent,
+                    current_percent,
+                    next_percent,
+                )
+                .unwrap_or(analysis.result.imp_block_cost_raw),
+            ImportanceAggregation::Mean => analysis.result.imp_block_cost_raw,
         };
         let imp_block_cost = match self.tuning.importance_aggregation {
             ImportanceAggregation::Mean => analysis.result.imp_block_cost_raw,
@@ -628,9 +658,20 @@ impl<T: Pixel> SceneChangeDetector<T> {
         let threshold = self.importance_threshold(avg_luma_8bit);
         if let Some(analysis) = self.score_deque.get_mut(index) {
             analysis.result.imp_block_cost = imp_block_cost;
+            analysis.result.global_imp_block_cost = global_imp_block_cost;
             analysis.result.imp_block_threshold = threshold;
             analysis.result.refresh_ratios();
         }
+    }
+
+    fn dark_adapted_relaxed_ratio(&self, avg_luma_8bit: f64, base_ratio: f64) -> f64 {
+        let darkness = smoothstep_darkness(
+            avg_luma_8bit,
+            self.tuning.importance_cut_dark_luma_low_8bit,
+            self.tuning.importance_cut_dark_luma_high_8bit,
+        );
+        (base_ratio - self.tuning.importance_cut_dark_ratio_boost * darkness)
+            .max(self.tuning.importance_cut_dark_min_ratio)
     }
 
     fn temporal_top_importance_score(
@@ -771,6 +812,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
             enabled,
             frames,
             threshold_8bit,
+            mask_percent,
             ..
         } = self.tuning.forward_similarity;
         if !enabled || frames == 0 || frame_set.len() < 3 {
@@ -779,7 +821,11 @@ impl<T: Pixel> SceneChangeDetector<T> {
 
         let max_offset = frames.min(frame_set.len().saturating_sub(2));
         for offset in 2..=max_offset + 1 {
-            let delta = self.luma_delta_8bit(frame_set[0], frame_set[offset]);
+            let delta = if mask_percent > 0.0 {
+                self.masked_luma_delta_8bit(frame_set[0], frame_set[offset], mask_percent)
+            } else {
+                self.luma_delta_8bit(frame_set[0], frame_set[offset])
+            };
             if delta <= threshold_8bit {
                 return Some(input_frameno + offset - 1);
             }
@@ -815,6 +861,18 @@ impl<T: Pixel> SceneChangeDetector<T> {
         }
 
         best.is_finite().then_some(best)
+    }
+
+    fn transient_similarity_threshold(&self, avg_luma_8bit: f64) -> f64 {
+        let TransientSimilarityOptions {
+            threshold_8bit,
+            dark_threshold_8bit,
+            dark_luma_low_8bit,
+            dark_luma_high_8bit,
+            ..
+        } = self.tuning.transient_similarity;
+        let darkness = smoothstep_darkness(avg_luma_8bit, dark_luma_low_8bit, dark_luma_high_8bit);
+        threshold_8bit + (dark_threshold_8bit - threshold_8bit) * darkness
     }
 
     fn masked_luma_delta_8bit(
@@ -885,6 +943,14 @@ impl<T: Pixel> SceneChangeDetector<T> {
 
 fn sample_range_scale(bit_depth: usize) -> f64 {
     (2.0_f64.powi(bit_depth as i32) - 1.0) / 255.0
+}
+
+fn smoothstep_darkness(avg_luma_8bit: f64, low_luma_8bit: f64, high_luma_8bit: f64) -> f64 {
+    if high_luma_8bit <= low_luma_8bit {
+        return 0.0;
+    }
+    let t = ((high_luma_8bit - avg_luma_8bit) / (high_luma_8bit - low_luma_8bit)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 fn mark_top_blocks(source: &[f64], percent: f64, selected: &mut [bool]) {
@@ -990,8 +1056,10 @@ pub struct ScenecutResult {
     pub inter_cost: f64,
     pub imp_block_cost_raw: f64,
     pub imp_block_cost: f64,
+    pub global_imp_block_cost: f64,
     pub imp_block_threshold: f64,
     pub imp_block_ratio: f64,
+    pub global_imp_block_ratio: f64,
     pub backward_adjusted_cost: f64,
     pub forward_adjusted_cost: f64,
     pub threshold: f64,
@@ -1017,8 +1085,10 @@ impl ScenecutResult {
             inter_cost,
             imp_block_cost_raw: imp_block_cost,
             imp_block_cost,
+            global_imp_block_cost: imp_block_cost,
             imp_block_threshold,
             imp_block_ratio: 0.0,
+            global_imp_block_ratio: 0.0,
             backward_adjusted_cost: 0.0,
             forward_adjusted_cost: 0.0,
             threshold,
@@ -1043,6 +1113,11 @@ impl ScenecutResult {
         };
         self.imp_block_ratio = if self.imp_block_threshold > 0.0 {
             self.imp_block_cost / self.imp_block_threshold
+        } else {
+            0.0
+        };
+        self.global_imp_block_ratio = if self.imp_block_threshold > 0.0 {
+            self.global_imp_block_cost / self.imp_block_threshold
         } else {
             0.0
         };
