@@ -237,8 +237,10 @@ impl DetectionTuning {
             forward_similarity: ForwardSimilarityOptions {
                 enabled: true,
                 frames: 60,
+                min_offset: 4,
                 threshold_8bit: 6.0,
                 mask_percent: 0.20,
+                require_return_candidate: true,
                 suppress_inside: true,
             },
             transient_similarity: TransientSimilarityOptions {
@@ -315,11 +317,17 @@ pub struct ForwardSimilarityOptions {
     pub enabled: bool,
     /// Number of future frames to inspect.
     pub frames: usize,
+    /// Minimum future offset before a frame can be accepted as a return. This
+    /// avoids suppressing hard cuts just because one of the next few frames is
+    /// still visually similar to the previous scene.
+    pub min_offset: usize,
     /// Maximum luma delta, in 8-bit units, considered a return to the previous
     /// scene. Uses masked block comparison when `mask_percent` is non-zero.
     pub threshold_8bit: f64,
     /// Fraction of most volatile blocks to mask when checking the return.
     pub mask_percent: f64,
+    /// Only accept a return frame if it is also a plausible cut candidate.
+    pub require_return_candidate: bool,
     /// Suppress additional cuts until the detected return frame.
     pub suppress_inside: bool,
 }
@@ -330,8 +338,10 @@ impl Default for ForwardSimilarityOptions {
         Self {
             enabled: false,
             frames: 0,
+            min_offset: 2,
             threshold_8bit: 6.0,
             mask_percent: 0.0,
+            require_return_candidate: false,
             suppress_inside: false,
         }
     }

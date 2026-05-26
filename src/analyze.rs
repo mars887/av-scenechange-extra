@@ -66,6 +66,12 @@ impl<T: Pixel> ScaleFunction<T> {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ForwardSimilarityMatch {
+    frame: usize,
+    delta: f64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ScenecutAnalysis {
     pub result: ScenecutResult,
@@ -539,9 +545,10 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 self.forward_similarity_return_frame(frame_set, input_frameno)
         {
             score.decision = ScenecutDecision::SuppressedForwardSimilarity;
-            score.forward_return_frame = Some(return_frame);
+            score.forward_return_frame = Some(return_frame.frame);
+            score.forward_similarity_score = Some(return_frame.delta);
             if self.tuning.forward_similarity.suppress_inside {
-                self.forward_suppress_until = Some(return_frame);
+                self.forward_suppress_until = Some(return_frame.frame);
             }
             scenecut = false;
         }
@@ -807,12 +814,14 @@ impl<T: Pixel> SceneChangeDetector<T> {
         &self,
         frame_set: &[&Arc<Frame<T>>],
         input_frameno: usize,
-    ) -> Option<usize> {
+    ) -> Option<ForwardSimilarityMatch> {
         let ForwardSimilarityOptions {
             enabled,
             frames,
+            min_offset,
             threshold_8bit,
             mask_percent,
+            require_return_candidate,
             ..
         } = self.tuning.forward_similarity;
         if !enabled || frames == 0 || frame_set.len() < 3 {
@@ -820,17 +829,36 @@ impl<T: Pixel> SceneChangeDetector<T> {
         }
 
         let max_offset = frames.min(frame_set.len().saturating_sub(2));
-        for offset in 2..=max_offset + 1 {
+        let min_offset = min_offset.max(2);
+        for offset in min_offset..=max_offset + 1 {
+            if require_return_candidate && !self.forward_return_candidate_passed(offset) {
+                continue;
+            }
             let delta = if mask_percent > 0.0 {
                 self.masked_luma_delta_8bit(frame_set[0], frame_set[offset], mask_percent)
             } else {
                 self.luma_delta_8bit(frame_set[0], frame_set[offset])
             };
             if delta <= threshold_8bit {
-                return Some(input_frameno + offset - 1);
+                return Some(ForwardSimilarityMatch {
+                    frame: input_frameno + offset - 1,
+                    delta,
+                });
             }
         }
         None
+    }
+
+    fn forward_return_candidate_passed(&self, offset: usize) -> bool {
+        let frame_offset = offset.saturating_sub(1);
+        if frame_offset == 0 || frame_offset > self.deque_offset {
+            return false;
+        }
+        let index = self.deque_offset - frame_offset;
+        self.score_deque.get(index).is_some_and(|analysis| {
+            analysis.result.forward_adjusted_cost >= analysis.result.threshold
+                || self.importance_cut_passed(index)
+        })
     }
 
     fn two_sided_masked_similarity(
@@ -1068,6 +1096,7 @@ pub struct ScenecutResult {
     pub me_bad_block_ratio: f64,
     pub me_good_block_ratio: f64,
     pub transient_similarity_score: Option<f64>,
+    pub forward_similarity_score: Option<f64>,
     pub decision: ScenecutDecision,
     pub forward_return_frame: Option<usize>,
 }
@@ -1097,6 +1126,7 @@ impl ScenecutResult {
             me_bad_block_ratio: 0.0,
             me_good_block_ratio: 0.0,
             transient_similarity_score: None,
+            forward_similarity_score: None,
             decision: ScenecutDecision::NotEvaluated,
             forward_return_frame: None,
         };
