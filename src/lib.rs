@@ -50,7 +50,7 @@ pub use crate::analyze::{
 
 const FRAME_PREFETCH_DEPTH: usize = 8;
 /// Version marker for diagnostics fields emitted by this fork.
-pub const DIAGNOSTICS_VERSION: &str = "av-scenechange-extra-forward-diagnostics-v1";
+pub const DIAGNOSTICS_VERSION: &str = "av-scenechange-extra-forward-postprocess-diagnostics-v1";
 
 /// Options determining how to run scene change detection.
 #[derive(Debug, Clone, Copy)]
@@ -566,6 +566,12 @@ pub fn detect_scene_changes<T: Pixel>(
                 }
             }
 
+            apply_forward_similarity_postprocess(
+                opts.tuning.forward_similarity,
+                &mut keyframes,
+                &mut scores,
+            );
+
             Ok(DetectionResults {
                 scene_changes: keyframes.into_iter().collect(),
                 frame_count: frameno,
@@ -624,6 +630,153 @@ pub fn detect_scene_changes<T: Pixel>(
     }
 
     Ok(results)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PostprocessForwardSimilarityMatch {
+    return_frame: usize,
+    return_candidate_frame: usize,
+    delta: f64,
+}
+
+fn apply_forward_similarity_postprocess(
+    options: ForwardSimilarityOptions,
+    keyframes: &mut BTreeSet<usize>,
+    scores: &mut BTreeMap<usize, ScenecutResult>,
+) {
+    if !options.enabled || !options.require_return_candidate || options.frames == 0 {
+        return;
+    }
+
+    let candidates = keyframes
+        .iter()
+        .copied()
+        .filter(|&frame| frame != 0)
+        .collect::<Vec<_>>();
+    for frame in candidates {
+        if !keyframes.contains(&frame) {
+            continue;
+        }
+
+        let Some(score) = scores.get(&frame).copied() else {
+            continue;
+        };
+        if !matches!(
+            score.decision,
+            ScenecutDecision::Cut | ScenecutDecision::CutImportance
+        ) {
+            continue;
+        }
+
+        let Some(similarity_match) =
+            forward_similarity_postprocess_match(frame, options, score, scores)
+        else {
+            continue;
+        };
+
+        keyframes.remove(&frame);
+        mark_forward_similarity_suppressed(
+            scores,
+            frame,
+            similarity_match.return_frame,
+            similarity_match.return_candidate_frame,
+            Some(similarity_match.delta),
+        );
+
+        if options.suppress_inside {
+            let inside = keyframes
+                .range((frame + 1)..=similarity_match.return_frame)
+                .copied()
+                .collect::<Vec<_>>();
+            for inside_frame in inside {
+                keyframes.remove(&inside_frame);
+                mark_forward_similarity_suppressed(
+                    scores,
+                    inside_frame,
+                    similarity_match.return_frame,
+                    similarity_match.return_candidate_frame,
+                    None,
+                );
+            }
+        }
+    }
+}
+
+fn forward_similarity_postprocess_match(
+    frame: usize,
+    options: ForwardSimilarityOptions,
+    score: ScenecutResult,
+    scores: &BTreeMap<usize, ScenecutResult>,
+) -> Option<PostprocessForwardSimilarityMatch> {
+    let min_offset = options.min_offset.max(2);
+    score
+        .forward_similarity_candidates
+        .iter()
+        .flatten()
+        .filter(|candidate| {
+            candidate.delta <= candidate.threshold
+                && candidate.offset >= min_offset
+                && candidate.offset <= options.frames + 1
+                && candidate.frame > frame
+        })
+        .filter_map(|candidate| {
+            let search_start = frame + min_offset;
+            let return_candidate_frame = scores
+                .range(search_start..=candidate.frame)
+                .rev()
+                .find_map(|(&candidate_frame, candidate_score)| {
+                    forward_similarity_return_score_passed(*candidate_score)
+                        .then_some(candidate_frame)
+                })?;
+
+            Some(PostprocessForwardSimilarityMatch {
+                return_frame: candidate.frame,
+                return_candidate_frame,
+                delta: candidate.delta,
+            })
+        })
+        .min_by(|left, right| {
+            left.delta
+                .partial_cmp(&right.delta)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+fn forward_similarity_return_score_passed(score: ScenecutResult) -> bool {
+    matches!(
+        score.decision,
+        ScenecutDecision::Cut
+            | ScenecutDecision::CutImportance
+            | ScenecutDecision::SuppressedForwardSimilarity
+            | ScenecutDecision::SuppressedTransientSimilarity
+    ) || score.forward_adjusted_cost >= score.threshold
+}
+
+fn mark_forward_similarity_suppressed(
+    scores: &mut BTreeMap<usize, ScenecutResult>,
+    frame: usize,
+    return_frame: usize,
+    return_candidate_frame: usize,
+    delta: Option<f64>,
+) {
+    let Some(score) = scores.get_mut(&frame) else {
+        return;
+    };
+
+    score.decision = ScenecutDecision::SuppressedForwardSimilarity;
+    score.forward_return_frame = Some(return_frame);
+    if let Some(delta) = delta {
+        score.forward_similarity_score = Some(delta);
+    }
+
+    for candidate in score.forward_similarity_candidates.iter_mut().flatten() {
+        if candidate.frame == return_frame {
+            candidate.decision = ForwardSimilarityCandidateDecision::Accepted;
+            candidate.candidate_frame = Some(return_candidate_frame);
+            candidate.candidate_offset = Some(return_candidate_frame - frame + 1);
+            break;
+        }
+    }
 }
 
 /// Specifies the scene detection algorithm to use
