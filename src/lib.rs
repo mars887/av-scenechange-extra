@@ -236,7 +236,7 @@ impl DetectionTuning {
             importance_cut_min_me_bad_ratio: 0.15,
             forward_similarity: ForwardSimilarityOptions {
                 enabled: true,
-                frames: 60,
+                frames: 80,
                 min_offset: 4,
                 threshold_8bit: 6.0,
                 mask_percent: 0.20,
@@ -326,7 +326,10 @@ pub struct ForwardSimilarityOptions {
     pub threshold_8bit: f64,
     /// Fraction of most volatile blocks to mask when checking the return.
     pub mask_percent: f64,
-    /// Only accept a return frame if it is also a plausible cut candidate.
+    /// Only accept a return frame if there is also a plausible future cut
+    /// candidate before that return. This keeps A-B-A suppression
+    /// segment-aware while allowing the best matching return frame to be a
+    /// stable interior frame after the B->A boundary.
     pub require_return_candidate: bool,
     /// Suppress additional cuts until the detected return frame.
     pub suppress_inside: bool,

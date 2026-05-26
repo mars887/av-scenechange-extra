@@ -831,7 +831,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
         let max_offset = frames.min(frame_set.len().saturating_sub(2));
         let min_offset = min_offset.max(2);
         for offset in min_offset..=max_offset + 1 {
-            if require_return_candidate && !self.forward_return_candidate_passed(offset) {
+            if require_return_candidate && !self.has_forward_return_candidate(min_offset, offset) {
                 continue;
             }
             let delta = if mask_percent > 0.0 {
@@ -847,6 +847,11 @@ impl<T: Pixel> SceneChangeDetector<T> {
             }
         }
         None
+    }
+
+    fn has_forward_return_candidate(&self, min_offset: usize, return_offset: usize) -> bool {
+        (min_offset..=return_offset)
+            .any(|candidate_offset| self.forward_return_candidate_passed(candidate_offset))
     }
 
     fn forward_return_candidate_passed(&self, offset: usize) -> bool {

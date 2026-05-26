@@ -48,10 +48,11 @@ adds opt-in tuning:
   cuts just because masked backgrounds are naturally similar.
 - Forward similarity now looks farther ahead in high mode and can use masked
   comparison to suppress short A-B-A returns as one transient segment instead
-  of cutting around the short middle scene. The return frame must be far enough
-  from the candidate and, in high mode, must also look like a plausible cut
-  candidate, preventing suppression from a merely similar adjacent or interior
-  frame.
+  of cutting around the short middle scene. In high mode, the matched return
+  frame must be far enough from the candidate and must occur after another
+  plausible cut candidate, preventing suppression from a merely similar
+  adjacent frame while still allowing stable interior frames after the return
+  boundary to close A-B-A and A-B-A-C-A chains.
 - Motion-estimation residual coverage is exposed as bad/good block ratios and
   used as additional evidence for relaxed dark-scene importance cuts.
 - Per-frame diagnostics in `ScenecutResult`, including cost ratios,
