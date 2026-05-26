@@ -413,7 +413,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
         frame_set: &[&Arc<Frame<T>>],
         input_frameno: usize,
     ) -> (bool, ScenecutResult) {
-        for idx in self.deque_offset..self.score_deque.len() {
+        for idx in 0..self.score_deque.len() {
             self.refresh_importance_metrics(idx);
         }
         let mut score = self.score_deque[self.deque_offset].result;
@@ -490,6 +490,14 @@ impl<T: Pixel> SceneChangeDetector<T> {
             score.decision = ScenecutDecision::NoCut;
         }
 
+        if !scenecut
+            && matches!(self.scene_detection_mode, SceneDetectionSpeed::High)
+            && self.importance_cut_passed(self.deque_offset)
+        {
+            score.decision = ScenecutDecision::CutImportance;
+            scenecut = true;
+        }
+
         if scenecut && self.is_forward_suppressed(input_frameno) {
             score.decision = ScenecutDecision::SuppressedForwardSimilarity;
             scenecut = false;
@@ -509,6 +517,26 @@ impl<T: Pixel> SceneChangeDetector<T> {
 
         self.score_deque[self.deque_offset].result = score;
         (scenecut, score)
+    }
+
+    fn importance_cut_passed(&self, index: usize) -> bool {
+        let Some(min_ratio) = self.tuning.importance_cut_ratio else {
+            return false;
+        };
+        let Some(current) = self.score_deque.get(index).map(|analysis| analysis.result) else {
+            return false;
+        };
+        if current.imp_block_ratio < min_ratio
+            || current.imp_block_cost < current.imp_block_threshold
+        {
+            return false;
+        }
+
+        self.score_deque
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx != index && idx.abs_diff(index) <= 2)
+            .all(|(_, analysis)| analysis.result.imp_block_cost <= current.imp_block_cost)
     }
 
     fn refresh_importance_metrics(&mut self, index: usize) {
@@ -674,6 +702,7 @@ pub enum ScenecutDecision {
     NotEvaluated,
     NoCut,
     Cut,
+    CutImportance,
     SuppressedImportance,
     SuppressedFlash,
     SuppressedMinDistance,

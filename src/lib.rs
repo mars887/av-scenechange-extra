@@ -138,6 +138,8 @@ pub struct DetectionTuning {
     pub importance_aggregation: ImportanceAggregation,
     /// Allows strong cost-ratio peaks to bypass the importance gate.
     pub strong_cut_ratio: Option<f64>,
+    /// Allows strong local importance-block peaks to trigger cuts in high mode.
+    pub importance_cut_ratio: Option<f64>,
     /// Optional A-B-A transient suppression.
     pub forward_similarity: ForwardSimilarityOptions,
 }
@@ -154,6 +156,7 @@ impl Default for DetectionTuning {
             importance_luma_ref_8bit: 64.0,
             importance_aggregation: ImportanceAggregation::Mean,
             strong_cut_ratio: None,
+            importance_cut_ratio: None,
             forward_similarity: ForwardSimilarityOptions::default(),
         }
     }
@@ -174,6 +177,7 @@ impl DetectionTuning {
                 next_percent: 0.10,
             },
             strong_cut_ratio: Some(2.5),
+            importance_cut_ratio: Some(2.0),
             forward_similarity: ForwardSimilarityOptions {
                 enabled: true,
                 frames: 24,

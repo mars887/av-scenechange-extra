@@ -17,7 +17,8 @@ The fork keeps the historical `standard` and `fast` behavior as the default and
 adds opt-in tuning:
 
 - `SceneDetectionSpeed::High`: cost-based detection with adaptive dark-scene
-  importance thresholds and short A-B-A transient suppression.
+  importance thresholds, an importance-driven local-peak cut path, and short
+  A-B-A transient suppression.
 - Correct high bit-depth threshold scaling for the fast detector via
   `FastThresholdScale::SampleRange`.
 - Adaptive importance block thresholding based on frame luma, so dark-to-dark
@@ -27,6 +28,9 @@ adds opt-in tuning:
   current comparison, and top 10% from the next comparison. This keeps localized
   scene changes from being diluted by dark or static background regions while
   avoiding a purely single-frame top-percentile decision.
+- Strong local importance peaks can become cuts in high mode even when the
+  motion/intra cost ratio stays below the normal threshold. This is intended
+  for dark-to-dark HDR cuts where the legacy cost threshold can remain too high.
 - Per-frame diagnostics in `ScenecutResult`, including cost ratios,
   importance ratios, luma, decision reason, and forward-similarity suppression
   metadata.
