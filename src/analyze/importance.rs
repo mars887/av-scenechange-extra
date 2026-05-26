@@ -16,24 +16,52 @@ pub const IMP_BLOCK_MV_UNITS_PER_PIXEL: i64 = 8;
 pub const IMP_BLOCK_SIZE_IN_MV_UNITS: i64 =
     IMPORTANCE_BLOCK_SIZE as i64 * IMP_BLOCK_MV_UNITS_PER_PIXEL;
 
+#[derive(Clone, Debug)]
+pub(crate) struct ImportanceBlockDiff {
+    pub mean: f64,
+    pub avg_luma_8bit: f64,
+    pub blocks: Vec<f64>,
+}
+
 #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
 #[doc(hidden)]
+#[allow(dead_code)]
 #[allow(clippy::missing_inline_in_public_items, clippy::must_use_candidate)]
 pub fn estimate_importance_block_difference<T: Pixel>(
     frame: &Arc<Frame<T>>,
     ref_frame: &Arc<Frame<T>>,
 ) -> f64 {
+    estimate_importance_block_difference_detailed(frame, ref_frame, frame.bit_depth.get() as usize)
+        .mean
+}
+
+pub(crate) fn estimate_importance_block_difference_detailed<T: Pixel>(
+    frame: &Arc<Frame<T>>,
+    ref_frame: &Arc<Frame<T>>,
+    bit_depth: usize,
+) -> ImportanceBlockDiff {
     let plane_org = &frame.y_plane;
     let plane_ref = &ref_frame.y_plane;
     let h_in_imp_b = plane_org.height().get() / IMPORTANCE_BLOCK_SIZE;
     let w_in_imp_b = plane_org.width().get() / IMPORTANCE_BLOCK_SIZE;
+    let block_count = w_in_imp_b * h_in_imp_b;
+    if block_count == 0 {
+        return ImportanceBlockDiff {
+            mean: 0.0,
+            avg_luma_8bit: 0.0,
+            blocks: Vec::new(),
+        };
+    }
 
     let mut imp_block_costs = 0;
+    let mut luma_sum = 0i64;
+    let mut blocks = Vec::with_capacity(block_count);
 
     (0..h_in_imp_b).for_each(|y| {
         (0..w_in_imp_b).for_each(|x| {
             let histogram_org_sum = sum_8x8_block(plane_org, x, y);
             let histogram_ref_sum = sum_8x8_block(plane_ref, x, y);
+            luma_sum += histogram_org_sum;
 
             let count = (IMPORTANCE_BLOCK_SIZE * IMPORTANCE_BLOCK_SIZE) as i64;
 
@@ -42,10 +70,23 @@ pub fn estimate_importance_block_difference<T: Pixel>(
                 .abs();
 
             imp_block_costs += mean as u64;
+            blocks.push(mean as f64);
         });
     });
 
-    imp_block_costs as f64 / (w_in_imp_b * h_in_imp_b) as f64
+    let sample_max = 2.0_f64.powi(bit_depth as i32) - 1.0;
+    let pixel_count = (block_count * IMPORTANCE_BLOCK_SIZE * IMPORTANCE_BLOCK_SIZE) as f64;
+    let avg_luma_8bit = if sample_max > 0.0 && pixel_count > 0.0 {
+        (luma_sum as f64 / pixel_count) * 255.0 / sample_max
+    } else {
+        0.0
+    };
+
+    ImportanceBlockDiff {
+        mean: imp_block_costs as f64 / block_count as f64,
+        avg_luma_8bit,
+        blocks,
+    }
 }
 
 fn sum_8x8_block<T: Pixel>(plane: &Plane<T>, x: usize, y: usize) -> i64 {

@@ -7,6 +7,34 @@
 
 Scenechange detection tool based on rav1e's scene detection code. It is focused around detecting scenechange points that will be optimal for an encoder to place keyframes. It may not be the best tool if your use case is to generate scene changes as a human would interpret them--for that there are other tools such as SCXvid and WWXD.
 
+## av-scenechange-extra fork
+
+This repository is a fork of `rust-av/av-scenechange` used to experiment with
+scene detection improvements for Av1an, especially difficult 10-bit HDR and
+dark-scene material.
+
+The fork keeps the historical `standard` and `fast` behavior as the default and
+adds opt-in tuning:
+
+- `SceneDetectionSpeed::High`: cost-based detection with adaptive dark-scene
+  importance thresholds and short A-B-A transient suppression.
+- Correct high bit-depth threshold scaling for the fast detector via
+  `FastThresholdScale::SampleRange`.
+- Adaptive importance block thresholding based on frame luma, so dark-to-dark
+  cuts are not rejected only because their average luma delta is small.
+- Temporal top-block importance aggregation: the current decision can aggregate
+  the top 10% blocks selected in the previous comparison, top 15% from the
+  current comparison, and top 10% from the next comparison. This keeps localized
+  scene changes from being diluted by dark or static background regions while
+  avoiding a purely single-frame top-percentile decision.
+- Per-frame diagnostics in `ScenecutResult`, including cost ratios,
+  importance ratios, luma, decision reason, and forward-similarity suppression
+  metadata.
+
+For local Av1an development, point `av1an-core` at this checkout with a path
+dependency and enable the `serialize` feature if diagnostics will be written to
+`scenes.json`.
+
 ## Usage
 
 ### Command Line
@@ -22,7 +50,7 @@ This will output the scenechange detection results as JSON to stdout.
 #### Options
 
 - `-o, --output <FILE>`: Write results to a file instead of stdout
-- `-s, --speed <LEVEL>`: Set detection speed (0 = best quality, 1 = fastest mode, default: 0)
+- `-s, --speed <LEVEL>`: Set detection speed (0 = standard, 1 = fastest mode, 2 = high quality, default: 0)
 - `--no-flash-detection`: Disable detection of short scene flashes
 - `--min-scenecut <FRAMES>`: Set minimum interval between consecutive scenecuts
 - `--max-scenecut <FRAMES>`: Set maximum interval between consecutive scenecuts (forces a scenecut)

@@ -11,10 +11,16 @@ use v_frame::{chroma::ChromaSubsampling, frame::Frame, pixel::Pixel, plane::Plan
 
 use self::fast::{FAST_THRESHOLD, detect_scale_factor};
 use crate::{
+    DetectionTuning,
+    FastThresholdScale,
+    ForwardSimilarityOptions,
+    ImportanceAggregation,
+    ImportanceThresholdMode,
     SceneDetectionSpeed,
     data::{
         motion::RefMEStats,
         plane::{downscale, downscale_in_place},
+        sad::sad_plane,
     },
 };
 
@@ -30,9 +36,6 @@ pub use self::{
     inter::estimate_inter_costs,
     intra::estimate_intra_costs,
 };
-
-/// Experiments have determined this to be an optimal threshold
-const IMP_BLOCK_DIFF_THRESHOLD: f64 = 7.0;
 
 /// Fast integer division where divisor is a nonzero power of 2
 pub(crate) fn fast_idiv(n: usize, d: NonZeroUsize) -> usize {
@@ -61,6 +64,23 @@ impl<T: Pixel> ScaleFunction<T> {
         }
     }
 }
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScenecutAnalysis {
+    pub result: ScenecutResult,
+    pub importance_blocks: Vec<f64>,
+}
+
+impl ScenecutAnalysis {
+    #[inline]
+    fn from_result(result: ScenecutResult) -> Self {
+        Self {
+            result,
+            importance_blocks: Vec::new(),
+        }
+    }
+}
+
 /// Runs keyframe detection on frames from the lookahead queue.
 ///
 /// This struct is intended for advanced users who need the ability to analyze
@@ -77,6 +97,7 @@ pub struct SceneChangeDetector<T: Pixel> {
     min_key_frame_interval: usize,
     /// Maximum number of frames between two scenecuts
     max_key_frame_interval: usize,
+    tuning: DetectionTuning,
 
     // Internal configuration options
     /// Minimum average difference between YUV deltas that will trigger a scene
@@ -101,7 +122,9 @@ pub struct SceneChangeDetector<T: Pixel> {
     /// Frame buffer for scaled frames
     downscaled_frame_buffer: Option<[Plane<T>; 2]>,
     /// Scenechange results for adaptive threshold
-    score_deque: Vec<ScenecutResult>,
+    score_deque: Vec<ScenecutAnalysis>,
+    /// Suppresses additional cuts while an A-B-A transient is active.
+    forward_suppress_until: Option<usize>,
     /// Temporary buffer used by `estimate_intra_costs`.
     /// We store it on the struct so we only need to allocate it once.
     temp_plane: Option<Plane<T>>,
@@ -127,6 +150,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
         chroma_sampling: ChromaSubsampling,
         lookahead_distance: usize,
         scene_detection_mode: SceneDetectionSpeed,
+        tuning: DetectionTuning,
         min_key_frame_interval: usize,
         max_key_frame_interval: usize,
     ) -> Self {
@@ -151,15 +175,22 @@ impl<T: Pixel> SceneChangeDetector<T> {
             1
         };
 
-        let threshold = FAST_THRESHOLD * (bit_depth as f64) / 8.0;
+        let threshold = match tuning.fast_threshold_scale {
+            FastThresholdScale::Legacy => FAST_THRESHOLD * (bit_depth as f64) / 8.0,
+            FastThresholdScale::SampleRange => {
+                tuning.fast_threshold_8bit * sample_range_scale(bit_depth)
+            }
+        };
 
         Self {
             threshold,
             scene_detection_mode,
+            tuning,
             scale_func,
             lookahead_offset,
             deque_offset,
             score_deque,
+            forward_suppress_until: None,
             scaled_pixels: pixels,
             bit_depth,
             frame_rate,
@@ -245,17 +276,29 @@ impl<T: Pixel> SceneChangeDetector<T> {
         }
 
         // Adaptive scenecut check
-        let (scenecut, score) = self.adaptive_scenecut();
-        let scenecut = self.handle_min_max_intervals(distance).unwrap_or(scenecut);
+        let (mut scenecut, mut score) = self.adaptive_scenecut(frame_set, input_frameno);
+        if let Some(interval_decision) = self.handle_min_max_intervals(distance) {
+            scenecut = interval_decision;
+            score.decision = if interval_decision {
+                ScenecutDecision::ForcedMaxDistance
+            } else {
+                ScenecutDecision::SuppressedMinDistance
+            };
+            if self.deque_offset < self.score_deque.len() {
+                self.score_deque[self.deque_offset].result = score;
+            }
+        }
         debug!(
-            "[SC-Detect] Frame {}: Raw={:5.1}  ImpBl={:5.1}  Bwd={:5.1}  Fwd={:5.1}  Th={:.1}  {}",
+            "[SC-Detect] Frame {}: Raw={:5.1}  ImpBl={:5.1}/{:.1}  Bwd={:5.1}  Fwd={:5.1}  \
+             Th={:.1}  {:?}",
             input_frameno,
             score.inter_cost,
             score.imp_block_cost,
+            score.imp_block_threshold,
             score.backward_adjusted_cost,
             score.forward_adjusted_cost,
             score.threshold,
-            if scenecut { "Scenecut" } else { "No cut" }
+            score.decision,
         );
 
         // Keep score deque of 5 backward frames
@@ -302,29 +345,37 @@ impl<T: Pixel> SceneChangeDetector<T> {
         frame2: &Arc<Frame<T>>,
         input_frameno: usize,
     ) {
-        let mut result = match self.scene_detection_mode {
-            SceneDetectionSpeed::Fast => self.fast_scenecut(frame1, frame2),
-            SceneDetectionSpeed::Standard => self.cost_scenecut(frame1, frame2, input_frameno),
+        let mut analysis = match self.scene_detection_mode {
+            SceneDetectionSpeed::Fast => {
+                ScenecutAnalysis::from_result(self.fast_scenecut(frame1, frame2))
+            }
+            SceneDetectionSpeed::Standard | SceneDetectionSpeed::High => {
+                self.cost_scenecut(frame1, frame2, input_frameno)
+            }
             _ => unreachable!(),
         };
 
         // Subtract the highest metric value of surrounding frames from the current one.
         // It makes the peaks in the metric more distinct.
-        if self.scene_detection_mode == SceneDetectionSpeed::Standard && self.deque_offset > 0 {
+        if matches!(
+            self.scene_detection_mode,
+            SceneDetectionSpeed::Standard | SceneDetectionSpeed::High
+        ) && self.deque_offset > 0
+        {
             if input_frameno == 1 {
                 // Accounts for the second frame not having a score to adjust against.
                 // It should always be 0 because the first frame of the video is always a
                 // keyframe.
-                result.backward_adjusted_cost = 0.0;
+                analysis.result.backward_adjusted_cost = 0.0;
             } else {
                 let mut adjusted_cost = f64::MAX;
                 for other_cost in self
                     .score_deque
                     .iter()
                     .take(self.deque_offset)
-                    .map(|i| i.inter_cost)
+                    .map(|i| i.result.inter_cost)
                 {
-                    let this_cost = result.inter_cost - other_cost;
+                    let this_cost = analysis.result.inter_cost - other_cost;
                     if this_cost < adjusted_cost {
                         adjusted_cost = this_cost;
                     }
@@ -333,21 +384,22 @@ impl<T: Pixel> SceneChangeDetector<T> {
                         break;
                     }
                 }
-                result.backward_adjusted_cost = adjusted_cost;
+                analysis.result.backward_adjusted_cost = adjusted_cost;
             }
             if !self.score_deque.is_empty() {
                 for i in 0..cmp::min(self.deque_offset, self.score_deque.len()) {
-                    let adjusted_cost = self.score_deque[i].inter_cost - result.inter_cost;
-                    if i == 0 || adjusted_cost < self.score_deque[i].forward_adjusted_cost {
-                        self.score_deque[i].forward_adjusted_cost = adjusted_cost;
+                    let adjusted_cost =
+                        self.score_deque[i].result.inter_cost - analysis.result.inter_cost;
+                    if i == 0 || adjusted_cost < self.score_deque[i].result.forward_adjusted_cost {
+                        self.score_deque[i].result.forward_adjusted_cost = adjusted_cost;
                     }
-                    if self.score_deque[i].forward_adjusted_cost < 0.0 {
-                        self.score_deque[i].forward_adjusted_cost = 0.0;
+                    if self.score_deque[i].result.forward_adjusted_cost < 0.0 {
+                        self.score_deque[i].result.forward_adjusted_cost = 0.0;
                     }
                 }
             }
         }
-        self.score_deque.insert(0, result);
+        self.score_deque.insert(0, analysis);
     }
 
     /// Compares current scene score to adapted threshold based on previous
@@ -356,8 +408,15 @@ impl<T: Pixel> SceneChangeDetector<T> {
     /// Value of current frame is offset by lookahead, if lookahead >=5
     ///
     /// Returns true if current scene score is higher than adapted threshold
-    fn adaptive_scenecut(&self) -> (bool, ScenecutResult) {
-        let score = self.score_deque[self.deque_offset];
+    fn adaptive_scenecut(
+        &mut self,
+        frame_set: &[&Arc<Frame<T>>],
+        input_frameno: usize,
+    ) -> (bool, ScenecutResult) {
+        for idx in self.deque_offset..self.score_deque.len() {
+            self.refresh_importance_metrics(idx);
+        }
+        let mut score = self.score_deque[self.deque_offset].result;
 
         // We use the importance block algorithm's cost metrics as a secondary algorithm
         // because, although it struggles in certain scenarios such as
@@ -369,25 +428,35 @@ impl<T: Pixel> SceneChangeDetector<T> {
         // (hard scenecut) or within the past few frames (pan). This helps
         // filter out a few false positives produced by the cost-based
         // algorithm.
-        let imp_block_threshold = IMP_BLOCK_DIFF_THRESHOLD * (self.bit_depth as f64) / 8.0;
-        if !&self.score_deque[self.deque_offset..]
+        let importance_gate_passed = self.score_deque[self.deque_offset..]
             .iter()
-            .any(|result| result.imp_block_cost >= imp_block_threshold)
-        {
+            .any(|analysis| analysis.result.imp_block_cost >= analysis.result.imp_block_threshold);
+        let strong_cut_gate_passed = self
+            .tuning
+            .strong_cut_ratio
+            .is_some_and(|ratio| score.cost_ratio >= ratio);
+        if !importance_gate_passed && !strong_cut_gate_passed {
+            score.decision = ScenecutDecision::SuppressedImportance;
+            self.score_deque[self.deque_offset].result = score;
             return (false, score);
         }
 
         let cost = score.forward_adjusted_cost;
+        let mut scenecut = cost >= score.threshold;
         if cost >= score.threshold {
             let back_deque = &self.score_deque[self.deque_offset + 1..];
             let forward_deque = &self.score_deque[..self.deque_offset];
             let back_over_tr_count = back_deque
                 .iter()
-                .filter(|result| result.backward_adjusted_cost >= result.threshold)
+                .filter(|analysis| {
+                    analysis.result.backward_adjusted_cost >= analysis.result.threshold
+                })
                 .count();
             let forward_over_tr_count = forward_deque
                 .iter()
-                .filter(|result| result.forward_adjusted_cost >= result.threshold)
+                .filter(|analysis| {
+                    analysis.result.forward_adjusted_cost >= analysis.result.threshold
+                })
                 .count();
 
             // Check for scenecut after the flashes
@@ -401,25 +470,215 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 1
             };
             if forward_over_tr_count == 0 && back_over_tr_count >= back_count_req {
-                return (true, score);
-            }
-
-            // Check for scenecut before flash
-            // If distance longer than max flash length
-            if back_over_tr_count == 0
+                score.decision = ScenecutDecision::Cut;
+                scenecut = true;
+            } else if back_over_tr_count == 0
                 && forward_over_tr_count == 1
-                && forward_deque[0].forward_adjusted_cost >= forward_deque[0].threshold
+                && forward_deque[0].result.forward_adjusted_cost
+                    >= forward_deque[0].result.threshold
             {
-                return (true, score);
+                score.decision = ScenecutDecision::Cut;
+                scenecut = true;
+            } else if back_over_tr_count != 0 || forward_over_tr_count != 0 {
+                score.decision = ScenecutDecision::SuppressedFlash;
+                scenecut = false;
+            } else {
+                score.decision = ScenecutDecision::Cut;
+                scenecut = true;
             }
+        } else {
+            score.decision = ScenecutDecision::NoCut;
+        }
 
-            if back_over_tr_count != 0 || forward_over_tr_count != 0 {
-                return (false, score);
+        if scenecut && self.is_forward_suppressed(input_frameno) {
+            score.decision = ScenecutDecision::SuppressedForwardSimilarity;
+            scenecut = false;
+        }
+
+        if scenecut
+            && let Some(return_frame) =
+                self.forward_similarity_return_frame(frame_set, input_frameno)
+        {
+            score.decision = ScenecutDecision::SuppressedForwardSimilarity;
+            score.forward_return_frame = Some(return_frame);
+            if self.tuning.forward_similarity.suppress_inside {
+                self.forward_suppress_until = Some(return_frame);
+            }
+            scenecut = false;
+        }
+
+        self.score_deque[self.deque_offset].result = score;
+        (scenecut, score)
+    }
+
+    fn refresh_importance_metrics(&mut self, index: usize) {
+        let Some(analysis) = self.score_deque.get(index) else {
+            return;
+        };
+        let imp_block_cost = match self.tuning.importance_aggregation {
+            ImportanceAggregation::Mean => analysis.result.imp_block_cost_raw,
+            ImportanceAggregation::TemporalTopBlocks {
+                previous_percent,
+                current_percent,
+                next_percent,
+            } => self
+                .temporal_top_importance_score(
+                    index,
+                    previous_percent,
+                    current_percent,
+                    next_percent,
+                )
+                .unwrap_or(analysis.result.imp_block_cost_raw),
+        };
+        let avg_luma_8bit = analysis.result.avg_luma_8bit;
+        let threshold = self.importance_threshold(avg_luma_8bit);
+        if let Some(analysis) = self.score_deque.get_mut(index) {
+            analysis.result.imp_block_cost = imp_block_cost;
+            analysis.result.imp_block_threshold = threshold;
+            analysis.result.refresh_ratios();
+        }
+    }
+
+    fn temporal_top_importance_score(
+        &self,
+        index: usize,
+        previous_percent: f64,
+        current_percent: f64,
+        next_percent: f64,
+    ) -> Option<f64> {
+        let current = self.score_deque.get(index)?;
+        let block_count = current.importance_blocks.len();
+        if block_count == 0 {
+            return None;
+        }
+
+        let mut selected = vec![false; block_count];
+        if let Some(previous) = self.score_deque.get(index + 1) {
+            mark_top_blocks(&previous.importance_blocks, previous_percent, &mut selected);
+        }
+        mark_top_blocks(&current.importance_blocks, current_percent, &mut selected);
+        if index > 0
+            && let Some(next) = self.score_deque.get(index - 1)
+        {
+            mark_top_blocks(&next.importance_blocks, next_percent, &mut selected);
+        }
+
+        let mut total = 0.0;
+        let mut selected_count = 0usize;
+        for (idx, &is_selected) in selected.iter().enumerate() {
+            if is_selected {
+                total += current.importance_blocks[idx];
+                selected_count += 1;
             }
         }
 
-        (cost >= score.threshold, score)
+        (selected_count > 0).then_some(total / selected_count as f64)
     }
+
+    pub(crate) fn importance_threshold(&self, avg_luma_8bit: f64) -> f64 {
+        let base = match self.tuning.importance_mode {
+            ImportanceThresholdMode::Fixed => {
+                self.tuning.importance_threshold_8bit * (self.bit_depth as f64) / 8.0
+            }
+            ImportanceThresholdMode::AdaptiveLuma => {
+                self.tuning.importance_threshold_8bit * sample_range_scale(self.bit_depth)
+            }
+        };
+        match self.tuning.importance_mode {
+            ImportanceThresholdMode::Fixed => base,
+            ImportanceThresholdMode::AdaptiveLuma => {
+                let luma_ref = self.tuning.importance_luma_ref_8bit.max(1.0);
+                let factor = (avg_luma_8bit.max(0.0) / luma_ref)
+                    .sqrt()
+                    .clamp(self.tuning.importance_min_factor, 1.0);
+                base * factor
+            }
+        }
+    }
+
+    fn is_forward_suppressed(&mut self, input_frameno: usize) -> bool {
+        if let Some(until) = self.forward_suppress_until {
+            if input_frameno <= until {
+                return true;
+            }
+            self.forward_suppress_until = None;
+        }
+        false
+    }
+
+    fn forward_similarity_return_frame(
+        &self,
+        frame_set: &[&Arc<Frame<T>>],
+        input_frameno: usize,
+    ) -> Option<usize> {
+        let ForwardSimilarityOptions {
+            enabled,
+            frames,
+            threshold_8bit,
+            ..
+        } = self.tuning.forward_similarity;
+        if !enabled || frames == 0 || frame_set.len() < 3 {
+            return None;
+        }
+
+        let max_offset = frames.min(frame_set.len().saturating_sub(2));
+        for offset in 2..=max_offset + 1 {
+            let delta = self.luma_delta_8bit(frame_set[0], frame_set[offset]);
+            if delta <= threshold_8bit {
+                return Some(input_frameno + offset - 1);
+            }
+        }
+        None
+    }
+
+    fn luma_delta_8bit(&self, frame1: &Arc<Frame<T>>, frame2: &Arc<Frame<T>>) -> f64 {
+        let pixels = frame1.y_plane.width().get() * frame1.y_plane.height().get();
+        if pixels == 0 {
+            return 0.0;
+        }
+        let raw_delta = sad_plane(&frame1.y_plane, &frame2.y_plane) as f64 / pixels as f64;
+        raw_delta / sample_range_scale(self.bit_depth)
+    }
+}
+
+fn sample_range_scale(bit_depth: usize) -> f64 {
+    (2.0_f64.powi(bit_depth as i32) - 1.0) / 255.0
+}
+
+fn mark_top_blocks(source: &[f64], percent: f64, selected: &mut [bool]) {
+    if source.is_empty() || selected.is_empty() || percent <= 0.0 {
+        return;
+    }
+
+    let take = ((source.len() as f64 * percent).ceil() as usize)
+        .max(1)
+        .min(source.len());
+    let mut indices = (0..source.len()).collect::<Vec<_>>();
+    indices.sort_unstable_by(|&a, &b| {
+        source[b]
+            .partial_cmp(&source[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    for idx in indices.into_iter().take(take) {
+        if let Some(slot) = selected.get_mut(idx) {
+            *slot = true;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[allow(missing_docs)]
+pub enum ScenecutDecision {
+    NotEvaluated,
+    NoCut,
+    Cut,
+    SuppressedImportance,
+    SuppressedFlash,
+    SuppressedMinDistance,
+    ForcedMaxDistance,
+    SuppressedForwardSimilarity,
 }
 
 /// Contains the scores for scenecut analysis on a single frame
@@ -428,8 +687,57 @@ impl<T: Pixel> SceneChangeDetector<T> {
 #[allow(missing_docs)]
 pub struct ScenecutResult {
     pub inter_cost: f64,
+    pub imp_block_cost_raw: f64,
     pub imp_block_cost: f64,
+    pub imp_block_threshold: f64,
+    pub imp_block_ratio: f64,
     pub backward_adjusted_cost: f64,
     pub forward_adjusted_cost: f64,
     pub threshold: f64,
+    pub cost_ratio: f64,
+    pub avg_luma_8bit: f64,
+    pub decision: ScenecutDecision,
+    pub forward_return_frame: Option<usize>,
+}
+
+impl ScenecutResult {
+    #[inline]
+    pub(crate) fn new(
+        inter_cost: f64,
+        imp_block_cost: f64,
+        imp_block_threshold: f64,
+        threshold: f64,
+        avg_luma_8bit: f64,
+    ) -> Self {
+        let mut result = Self {
+            inter_cost,
+            imp_block_cost_raw: imp_block_cost,
+            imp_block_cost,
+            imp_block_threshold,
+            imp_block_ratio: 0.0,
+            backward_adjusted_cost: 0.0,
+            forward_adjusted_cost: 0.0,
+            threshold,
+            cost_ratio: 0.0,
+            avg_luma_8bit,
+            decision: ScenecutDecision::NotEvaluated,
+            forward_return_frame: None,
+        };
+        result.refresh_ratios();
+        result
+    }
+
+    #[inline]
+    pub(crate) fn refresh_ratios(&mut self) {
+        self.cost_ratio = if self.threshold > 0.0 {
+            self.forward_adjusted_cost / self.threshold
+        } else {
+            0.0
+        };
+        self.imp_block_ratio = if self.imp_block_threshold > 0.0 {
+            self.imp_block_cost / self.imp_block_threshold
+        } else {
+            0.0
+        };
+    }
 }

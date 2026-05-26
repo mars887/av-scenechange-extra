@@ -132,9 +132,9 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "av-decoders"
-version = "0.10.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a31ed07c3a0db5375deded31ba4db91bdf43660781680eae78392d3dafd77d9d"
+checksum = "93ef6a87c007444f81cb3948e39dd2566e2d70d7abbbb806d4bf19e98cae3b60"
 dependencies = [
  "ffmpeg-the-third",
  "ffms2-sys",
@@ -497,9 +497,9 @@ dependencies = [
 
 [[package]]
 name = "ffmpeg-sys-the-third"
-version = "5.0.0+ffmpeg-8.1"
+version = "4.1.0+ffmpeg-8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b00c204bb97c2b6c0329104c3e8bcf58d4d13cc88a04233326570672e0c2c5c9"
+checksum = "e0c1bf5e362dfb2fbdf9b3e634f3d7f7f0f057103689f518ba4fd96813faf1ef"
 dependencies = [
  "bindgen",
  "cc",
@@ -511,9 +511,9 @@ dependencies = [
 
 [[package]]
 name = "ffmpeg-the-third"
-version = "5.0.0+ffmpeg-8.1"
+version = "4.1.0+ffmpeg-8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "791f0d9315e4f0a0861fa5c8ca8d70a1bd099cce72bff111b4f7ed8d6ebe8ba3"
+checksum = "71a274244c87178cd01144536061d63114cecea74cb1037a3614c81cc7ca01e0"
 dependencies = [
  "bitflags",
  "ffmpeg-sys-the-third",

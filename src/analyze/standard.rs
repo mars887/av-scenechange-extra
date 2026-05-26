@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use v_frame::{frame::Frame, pixel::Pixel};
 
-use super::{SceneChangeDetector, ScenecutResult};
+use super::{SceneChangeDetector, ScenecutAnalysis, ScenecutResult};
 use crate::{
     analyze::{
-        importance::estimate_importance_block_difference,
+        importance::estimate_importance_block_difference_detailed,
         inter::estimate_inter_costs,
         intra::estimate_intra_costs,
     },
@@ -29,10 +29,10 @@ impl<T: Pixel> SceneChangeDetector<T> {
         frame1: &Arc<Frame<T>>,
         frame2: &Arc<Frame<T>>,
         input_frameno: usize,
-    ) -> ScenecutResult {
+    ) -> ScenecutAnalysis {
         let mut intra_cost = 0.0;
         let mut mv_inter_cost = 0.0;
-        let mut imp_block_cost = 0.0;
+        let mut imp_block_diff = None;
 
         let cols = 2 * self.resolution.0.align_power_of_two_and_shift(3);
         let rows = 2 * self.resolution.1.align_power_of_two_and_shift(3);
@@ -71,7 +71,11 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 );
             });
             s.spawn(|_| {
-                imp_block_cost = estimate_importance_block_difference(frame2, frame1);
+                imp_block_diff = Some(estimate_importance_block_difference_detailed(
+                    frame2,
+                    frame1,
+                    self.bit_depth,
+                ));
             });
         });
 
@@ -82,13 +86,17 @@ impl<T: Pixel> SceneChangeDetector<T> {
         // adaptive scenecut code.
         const BIAS: f64 = 0.7;
         let threshold = intra_cost * (1.0 - BIAS);
+        let imp_block_diff = imp_block_diff.expect("importance block diff should be set");
 
-        ScenecutResult {
-            inter_cost: mv_inter_cost,
-            imp_block_cost,
-            threshold,
-            backward_adjusted_cost: 0.0,
-            forward_adjusted_cost: 0.0,
+        ScenecutAnalysis {
+            result: ScenecutResult::new(
+                mv_inter_cost,
+                imp_block_diff.mean,
+                self.importance_threshold(imp_block_diff.avg_luma_8bit),
+                threshold,
+                imp_block_diff.avg_luma_8bit,
+            ),
+            importance_blocks: imp_block_diff.blocks,
         }
     }
 }

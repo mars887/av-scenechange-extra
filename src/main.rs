@@ -21,7 +21,8 @@ struct Args {
     #[clap(long, short, value_parser)]
     pub output: Option<String>,
 
-    /// Speed level for scene-change detection, 0: best quality, 1: fastest mode
+    /// Speed level for scene-change detection, 0: standard, 1: fastest mode, 2:
+    /// high quality
     #[clap(long, short, value_parser, default_value_t = 0)]
     pub speed: u8,
 
@@ -66,8 +67,15 @@ fn main() -> Result<()> {
     opts.analysis_speed = match matches.speed {
         0 => SceneDetectionSpeed::Standard,
         1 => SceneDetectionSpeed::Fast,
-        _ => panic!("Speed mode must be in range [0; 1]"),
+        2 => SceneDetectionSpeed::High,
+        _ => panic!("Speed mode must be in range [0; 2]"),
     };
+    if opts.analysis_speed == SceneDetectionSpeed::High {
+        opts = DetectionOptions::high_quality();
+        opts.detect_flashes = !matches.no_flash_detection;
+        opts.min_scenecut_distance = matches.min_scenecut;
+        opts.max_scenecut_distance = matches.max_scenecut;
+    }
 
     let results = match matches.input.as_str() {
         "-" => {

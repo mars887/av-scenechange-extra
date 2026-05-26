@@ -34,26 +34,34 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 let &[first, second] = &frame_buffer;
                 let delta = self.delta_in_planes(first, second);
 
-                ScenecutResult {
-                    threshold: self.threshold,
-                    inter_cost: delta,
-                    imp_block_cost: delta,
-                    forward_adjusted_cost: delta,
-                    backward_adjusted_cost: delta,
-                }
+                let mut result = ScenecutResult::new(
+                    delta,
+                    delta,
+                    self.importance_threshold(0.0),
+                    self.threshold,
+                    0.0,
+                );
+                result.forward_adjusted_cost = delta;
+                result.backward_adjusted_cost = delta;
+                result.refresh_ratios();
+                result
             } else {
                 unreachable!()
             }
         } else {
             let delta = self.delta_in_planes(&frame1.y_plane, &frame2.y_plane);
 
-            ScenecutResult {
-                threshold: self.threshold,
-                inter_cost: delta,
-                imp_block_cost: delta,
-                backward_adjusted_cost: delta,
-                forward_adjusted_cost: delta,
-            }
+            let mut result = ScenecutResult::new(
+                delta,
+                delta,
+                self.importance_threshold(0.0),
+                self.threshold,
+                0.0,
+            );
+            result.forward_adjusted_cost = delta;
+            result.backward_adjusted_cost = delta;
+            result.refresh_ratios();
+            result
         }
     }
 
