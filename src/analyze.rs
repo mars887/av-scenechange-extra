@@ -528,6 +528,12 @@ impl<T: Pixel> SceneChangeDetector<T> {
         };
         if current.imp_block_ratio < min_ratio
             || current.imp_block_cost < current.imp_block_threshold
+            || current.cost_ratio < self.tuning.importance_cut_min_cost_ratio
+        {
+            return false;
+        }
+        if let Some(max_luma_8bit) = self.tuning.importance_cut_max_luma_8bit
+            && current.avg_luma_8bit > max_luma_8bit
         {
             return false;
         }

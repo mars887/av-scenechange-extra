@@ -31,6 +31,8 @@ adds opt-in tuning:
 - Strong local importance peaks can become cuts in high mode even when the
   motion/intra cost ratio stays below the normal threshold. This is intended
   for dark-to-dark HDR cuts where the legacy cost threshold can remain too high.
+  This path is constrained to dark frames with some cost-ratio evidence so fast
+  motion in normal-brightness scenes does not create clusters of false cuts.
 - Per-frame diagnostics in `ScenecutResult`, including cost ratios,
   importance ratios, luma, decision reason, and forward-similarity suppression
   metadata.
