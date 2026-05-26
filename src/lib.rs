@@ -40,12 +40,21 @@ pub use av_decoders::{self, Decoder};
 pub use num_rational::Rational32;
 use v_frame::pixel::Pixel;
 
-pub use crate::analyze::{SceneChangeDetector, ScenecutDecision, ScenecutResult};
+pub use crate::analyze::{
+    ForwardSimilarityCandidate,
+    ForwardSimilarityCandidateDecision,
+    SceneChangeDetector,
+    ScenecutDecision,
+    ScenecutResult,
+};
 
 const FRAME_PREFETCH_DEPTH: usize = 8;
+/// Version marker for diagnostics fields emitted by this fork.
+pub const DIAGNOSTICS_VERSION: &str = "av-scenechange-extra-forward-diagnostics-v1";
 
 /// Options determining how to run scene change detection.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 pub struct DetectionOptions {
     /// The speed of detection algorithm to use.
     /// Slower algorithms are more accurate/better for use in encoders.
@@ -619,6 +628,7 @@ pub fn detect_scene_changes<T: Pixel>(
 
 /// Specifies the scene detection algorithm to use
 #[derive(Clone, Copy, Debug, PartialOrd, PartialEq, Eq)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 pub enum SceneDetectionSpeed {
     /// Fastest scene detection using pixel-wise comparison
     Fast,

@@ -31,6 +31,8 @@ mod inter;
 mod intra;
 mod standard;
 
+const FORWARD_SIMILARITY_DIAGNOSTIC_SLOTS: usize = 8;
+
 #[cfg(feature = "bench-internals")]
 pub use self::{
     importance::estimate_importance_block_difference,
@@ -70,6 +72,35 @@ impl<T: Pixel> ScaleFunction<T> {
 struct ForwardSimilarityMatch {
     frame: usize,
     delta: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ForwardSimilaritySearch {
+    accepted: Option<ForwardSimilarityMatch>,
+    candidates: [Option<ForwardSimilarityCandidate>; FORWARD_SIMILARITY_DIAGNOSTIC_SLOTS],
+    rejected_candidates: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[allow(missing_docs)]
+pub enum ForwardSimilarityCandidateDecision {
+    Accepted,
+    MissingReturnCandidate,
+    DeltaAboveThreshold,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+#[allow(missing_docs)]
+pub struct ForwardSimilarityCandidate {
+    pub frame: usize,
+    pub offset: usize,
+    pub delta: f64,
+    pub threshold: f64,
+    pub candidate_frame: Option<usize>,
+    pub candidate_offset: Option<usize>,
+    pub decision: ForwardSimilarityCandidateDecision,
 }
 
 #[derive(Clone, Debug)]
@@ -540,17 +571,18 @@ impl<T: Pixel> SceneChangeDetector<T> {
             scenecut = false;
         }
 
-        if scenecut
-            && let Some(return_frame) =
-                self.forward_similarity_return_frame(frame_set, input_frameno)
-        {
-            score.decision = ScenecutDecision::SuppressedForwardSimilarity;
-            score.forward_return_frame = Some(return_frame.frame);
-            score.forward_similarity_score = Some(return_frame.delta);
-            if self.tuning.forward_similarity.suppress_inside {
-                self.forward_suppress_until = Some(return_frame.frame);
+        if scenecut && let Some(search) = self.forward_similarity_search(frame_set, input_frameno) {
+            score.forward_similarity_candidates = search.candidates;
+            score.forward_similarity_rejected_candidates = search.rejected_candidates;
+            if let Some(return_frame) = search.accepted {
+                score.decision = ScenecutDecision::SuppressedForwardSimilarity;
+                score.forward_return_frame = Some(return_frame.frame);
+                score.forward_similarity_score = Some(return_frame.delta);
+                if self.tuning.forward_similarity.suppress_inside {
+                    self.forward_suppress_until = Some(return_frame.frame);
+                }
+                scenecut = false;
             }
-            scenecut = false;
         }
 
         self.score_deque[self.deque_offset].result = score;
@@ -810,11 +842,11 @@ impl<T: Pixel> SceneChangeDetector<T> {
         false
     }
 
-    fn forward_similarity_return_frame(
+    fn forward_similarity_search(
         &self,
         frame_set: &[&Arc<Frame<T>>],
         input_frameno: usize,
-    ) -> Option<ForwardSimilarityMatch> {
+    ) -> Option<ForwardSimilaritySearch> {
         let ForwardSimilarityOptions {
             enabled,
             frames,
@@ -830,28 +862,54 @@ impl<T: Pixel> SceneChangeDetector<T> {
 
         let max_offset = frames.min(frame_set.len().saturating_sub(2));
         let min_offset = min_offset.max(2);
+        let mut candidates = [None; FORWARD_SIMILARITY_DIAGNOSTIC_SLOTS];
+        let mut accepted = None;
+        let mut rejected_candidates = 0usize;
         for offset in min_offset..=max_offset + 1 {
-            if require_return_candidate && !self.has_forward_return_candidate(min_offset, offset) {
-                continue;
-            }
+            let return_candidate = self.forward_return_candidate(min_offset, offset);
             let delta = if mask_percent > 0.0 {
                 self.masked_luma_delta_8bit(frame_set[0], frame_set[offset], mask_percent)
             } else {
                 self.luma_delta_8bit(frame_set[0], frame_set[offset])
             };
-            if delta <= threshold_8bit {
-                return Some(ForwardSimilarityMatch {
-                    frame: input_frameno + offset - 1,
+            let decision = if require_return_candidate && return_candidate.is_none() {
+                ForwardSimilarityCandidateDecision::MissingReturnCandidate
+            } else if delta > threshold_8bit {
+                ForwardSimilarityCandidateDecision::DeltaAboveThreshold
+            } else {
+                ForwardSimilarityCandidateDecision::Accepted
+            };
+            let candidate = ForwardSimilarityCandidate {
+                frame: input_frameno + offset - 1,
+                offset,
+                delta,
+                threshold: threshold_8bit,
+                candidate_frame: return_candidate
+                    .map(|candidate_offset| input_frameno + candidate_offset - 1),
+                candidate_offset: return_candidate,
+                decision,
+            };
+            record_forward_similarity_candidate(&mut candidates, candidate);
+            if decision == ForwardSimilarityCandidateDecision::Accepted {
+                accepted = Some(ForwardSimilarityMatch {
+                    frame: candidate.frame,
                     delta,
                 });
+                break;
             }
+            rejected_candidates += 1;
         }
-        None
+        Some(ForwardSimilaritySearch {
+            accepted,
+            candidates,
+            rejected_candidates,
+        })
     }
 
-    fn has_forward_return_candidate(&self, min_offset: usize, return_offset: usize) -> bool {
+    fn forward_return_candidate(&self, min_offset: usize, return_offset: usize) -> Option<usize> {
         (min_offset..=return_offset)
-            .any(|candidate_offset| self.forward_return_candidate_passed(candidate_offset))
+            .rev()
+            .find(|&candidate_offset| self.forward_return_candidate_passed(candidate_offset))
     }
 
     fn forward_return_candidate_passed(&self, offset: usize) -> bool {
@@ -986,6 +1044,61 @@ fn smoothstep_darkness(avg_luma_8bit: f64, low_luma_8bit: f64, high_luma_8bit: f
     t * t * (3.0 - 2.0 * t)
 }
 
+fn record_forward_similarity_candidate(
+    candidates: &mut [Option<ForwardSimilarityCandidate>; FORWARD_SIMILARITY_DIAGNOSTIC_SLOTS],
+    candidate: ForwardSimilarityCandidate,
+) {
+    if let Some(slot) = candidates.iter_mut().find(|slot| slot.is_none()) {
+        *slot = Some(candidate);
+        sort_forward_similarity_candidates(candidates);
+        return;
+    }
+
+    let Some((worst_idx, worst)) = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, slot)| slot.map(|candidate| (idx, candidate)))
+        .max_by(|(_, left), (_, right)| {
+            left.delta
+                .partial_cmp(&right.delta)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    else {
+        return;
+    };
+
+    if candidate.decision == ForwardSimilarityCandidateDecision::Accepted
+        || candidate.delta < worst.delta
+    {
+        candidates[worst_idx] = Some(candidate);
+        sort_forward_similarity_candidates(candidates);
+    }
+}
+
+fn forward_similarity_candidates_empty(
+    candidates: &[Option<ForwardSimilarityCandidate>; FORWARD_SIMILARITY_DIAGNOSTIC_SLOTS],
+) -> bool {
+    candidates.iter().all(Option::is_none)
+}
+
+fn usize_is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+fn sort_forward_similarity_candidates(
+    candidates: &mut [Option<ForwardSimilarityCandidate>; FORWARD_SIMILARITY_DIAGNOSTIC_SLOTS],
+) {
+    candidates.sort_by(|left, right| match (left, right) {
+        (Some(left), Some(right)) => left
+            .delta
+            .partial_cmp(&right.delta)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+}
+
 fn mark_top_blocks(source: &[f64], percent: f64, selected: &mut [bool]) {
     if source.is_empty() || selected.is_empty() || percent <= 0.0 {
         return;
@@ -1102,6 +1215,17 @@ pub struct ScenecutResult {
     pub me_good_block_ratio: f64,
     pub transient_similarity_score: Option<f64>,
     pub forward_similarity_score: Option<f64>,
+    #[cfg_attr(
+        feature = "serialize",
+        serde(default, skip_serializing_if = "forward_similarity_candidates_empty")
+    )]
+    pub forward_similarity_candidates:
+        [Option<ForwardSimilarityCandidate>; FORWARD_SIMILARITY_DIAGNOSTIC_SLOTS],
+    #[cfg_attr(
+        feature = "serialize",
+        serde(default, skip_serializing_if = "usize_is_zero")
+    )]
+    pub forward_similarity_rejected_candidates: usize,
     pub decision: ScenecutDecision,
     pub forward_return_frame: Option<usize>,
 }
@@ -1132,6 +1256,8 @@ impl ScenecutResult {
             me_good_block_ratio: 0.0,
             transient_similarity_score: None,
             forward_similarity_score: None,
+            forward_similarity_candidates: [None; FORWARD_SIMILARITY_DIAGNOSTIC_SLOTS],
+            forward_similarity_rejected_candidates: 0,
             decision: ScenecutDecision::NotEvaluated,
             forward_return_frame: None,
         };
