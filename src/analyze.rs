@@ -81,12 +81,19 @@ struct ForwardSimilaritySearch {
     rejected_candidates: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ForwardReturnCandidate {
+    offset: usize,
+    score: ScenecutResult,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[allow(missing_docs)]
 pub enum ForwardSimilarityCandidateDecision {
     Accepted,
     MissingReturnCandidate,
+    DominantReturnCandidate,
     DeltaAboveThreshold,
 }
 
@@ -627,6 +634,17 @@ impl<T: Pixel> SceneChangeDetector<T> {
         {
             return false;
         }
+        if self.tuning.importance_cut_max_me_good_ratio > 0.0
+            && current.me_good_block_ratio > self.tuning.importance_cut_max_me_good_ratio
+        {
+            return false;
+        }
+        if self.tuning.importance_cut_bright_max_cost_ratio > 0.0
+            && current.avg_luma_8bit > self.tuning.importance_cut_dark_luma_high_8bit
+            && current.cost_ratio > self.tuning.importance_cut_bright_max_cost_ratio
+        {
+            return false;
+        }
 
         let strict_passed = current.imp_block_ratio >= min_ratio
             && current.cost_ratio >= self.tuning.importance_cut_min_cost_ratio;
@@ -906,10 +924,12 @@ impl<T: Pixel> SceneChangeDetector<T> {
         let mut rejected_candidates = 0usize;
         for offset in min_offset..=max_offset {
             let return_candidate = self.forward_return_candidate(min_offset, offset);
+            let return_candidate_offset =
+                return_candidate.map(|return_candidate| return_candidate.offset);
 
             let Some(post_start_offset) = self.forward_similarity_post_start_offset(
                 offset,
-                return_candidate,
+                return_candidate_offset,
                 reference_window.len(),
             ) else {
                 rejected_candidates += 1;
@@ -922,21 +942,36 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 offset,
                 options,
             );
-            let decision = if require_return_candidate && return_candidate.is_none() {
-                ForwardSimilarityCandidateDecision::MissingReturnCandidate
-            } else if delta > threshold_8bit {
-                ForwardSimilarityCandidateDecision::DeltaAboveThreshold
-            } else {
-                ForwardSimilarityCandidateDecision::Accepted
-            };
+            let allow_flash_return = require_return_candidate
+                && return_candidate.is_none()
+                && forward_similarity_flash_return_without_candidate_allowed(
+                    options, score, offset, delta,
+                );
+            let decision =
+                if require_return_candidate && return_candidate.is_none() && !allow_flash_return {
+                    ForwardSimilarityCandidateDecision::MissingReturnCandidate
+                } else if let Some(return_candidate) = return_candidate
+                    && !forward_similarity_return_candidate_allowed(
+                        options,
+                        score,
+                        return_candidate.score,
+                        delta,
+                    )
+                {
+                    ForwardSimilarityCandidateDecision::DominantReturnCandidate
+                } else if delta > threshold_8bit {
+                    ForwardSimilarityCandidateDecision::DeltaAboveThreshold
+                } else {
+                    ForwardSimilarityCandidateDecision::Accepted
+                };
             let candidate = ForwardSimilarityCandidate {
                 frame: input_frameno + offset - 1,
                 offset,
                 delta,
                 threshold: threshold_8bit,
-                candidate_frame: return_candidate
+                candidate_frame: return_candidate_offset
                     .map(|candidate_offset| input_frameno + candidate_offset - 1),
-                candidate_offset: return_candidate,
+                candidate_offset: return_candidate_offset,
                 decision,
             };
             record_forward_similarity_candidate(&mut candidates, candidate);
@@ -1018,22 +1053,31 @@ impl<T: Pixel> SceneChangeDetector<T> {
         delta / comparison_frames as f64
     }
 
-    fn forward_return_candidate(&self, min_offset: usize, return_offset: usize) -> Option<usize> {
+    fn forward_return_candidate(
+        &self,
+        min_offset: usize,
+        return_offset: usize,
+    ) -> Option<ForwardReturnCandidate> {
         (min_offset..=return_offset)
             .rev()
-            .find(|&candidate_offset| self.forward_return_candidate_passed(candidate_offset))
+            .find_map(|candidate_offset| {
+                self.forward_return_candidate_score(candidate_offset)
+                    .map(|score| ForwardReturnCandidate {
+                        offset: candidate_offset,
+                        score,
+                    })
+            })
     }
 
-    fn forward_return_candidate_passed(&self, offset: usize) -> bool {
+    fn forward_return_candidate_score(&self, offset: usize) -> Option<ScenecutResult> {
         let frame_offset = offset.saturating_sub(1);
         if frame_offset == 0 || frame_offset > self.deque_offset {
-            return false;
+            return None;
         }
         let index = self.deque_offset - frame_offset;
-        self.score_deque.get(index).is_some_and(|analysis| {
-            analysis.result.forward_adjusted_cost >= analysis.result.threshold
-                || self.importance_cut_passed(index)
-        })
+        let score = self.score_deque.get(index)?.result;
+        (score.forward_adjusted_cost >= score.threshold || self.importance_cut_passed(index))
+            .then_some(score)
     }
 
     fn two_sided_masked_similarity(
@@ -1362,6 +1406,9 @@ pub(crate) fn forward_similarity_threshold_8bit(
     if relaxed <= strict {
         return strict;
     }
+    if options.relaxed_max_cost_ratio > 0.0 && score.cost_ratio > options.relaxed_max_cost_ratio {
+        return strict;
+    }
 
     let hard_cut =
         options.relaxed_min_cost_ratio > 0.0 && score.cost_ratio >= options.relaxed_min_cost_ratio;
@@ -1374,6 +1421,42 @@ pub(crate) fn forward_similarity_threshold_8bit(
     } else {
         strict
     }
+}
+
+pub(crate) fn forward_similarity_return_candidate_allowed(
+    options: ForwardSimilarityOptions,
+    score: ScenecutResult,
+    return_candidate_score: ScenecutResult,
+    delta: f64,
+) -> bool {
+    if delta <= options.threshold_8bit {
+        return true;
+    }
+    if forward_similarity_threshold_8bit(options, score) <= options.threshold_8bit {
+        return true;
+    }
+
+    let max_return = options.relaxed_max_return_cost_ratio;
+    let max_multiplier = options.relaxed_max_return_cost_ratio_multiplier;
+    if max_return <= 0.0 || max_multiplier <= 0.0 {
+        return true;
+    }
+
+    return_candidate_score.cost_ratio <= max_return
+        || return_candidate_score.cost_ratio <= score.cost_ratio * max_multiplier
+}
+
+fn forward_similarity_flash_return_without_candidate_allowed(
+    options: ForwardSimilarityOptions,
+    score: ScenecutResult,
+    offset: usize,
+    delta: f64,
+) -> bool {
+    options.flash_return_without_candidate
+        && options.flash_return_frames > 0
+        && offset <= options.flash_return_frames
+        && score.cost_ratio >= options.flash_return_min_cost_ratio
+        && delta <= options.threshold_8bit
 }
 
 fn sample_range_scale(bit_depth: usize) -> f64 {
@@ -1457,6 +1540,7 @@ mod tests {
             threshold_8bit: 6.0,
             relaxed_threshold_8bit: 7.5,
             relaxed_min_cost_ratio: 1.0,
+            relaxed_max_cost_ratio: 3.0,
             relaxed_importance_min_cost_ratio: 0.45,
             relaxed_min_imp_block_ratio: 3.6,
             ..ForwardSimilarityOptions::default()
@@ -1473,6 +1557,78 @@ mod tests {
             forward_similarity_threshold_8bit(options, score_with_ratios(0.49, 3.7)),
             7.5
         );
+        assert_eq!(
+            forward_similarity_threshold_8bit(options, score_with_ratios(3.1, 5.0)),
+            6.0
+        );
+    }
+
+    #[test]
+    fn forward_similarity_rejects_dominant_return_candidate_for_relaxed_match() {
+        let options = ForwardSimilarityOptions {
+            threshold_8bit: 6.0,
+            relaxed_threshold_8bit: 7.5,
+            relaxed_min_cost_ratio: 1.0,
+            relaxed_max_cost_ratio: 3.0,
+            relaxed_importance_min_cost_ratio: 0.45,
+            relaxed_min_imp_block_ratio: 3.6,
+            relaxed_max_return_cost_ratio: 2.5,
+            relaxed_max_return_cost_ratio_multiplier: 4.0,
+            ..ForwardSimilarityOptions::default()
+        };
+        assert!(forward_similarity_return_candidate_allowed(
+            options,
+            score_with_ratios(1.1, 3.0),
+            score_with_ratios(2.4, 3.0),
+            7.1
+        ));
+        assert!(!forward_similarity_return_candidate_allowed(
+            options,
+            score_with_ratios(0.9, 4.0),
+            score_with_ratios(9.0, 3.0),
+            7.1
+        ));
+        assert!(forward_similarity_return_candidate_allowed(
+            options,
+            score_with_ratios(0.9, 4.0),
+            score_with_ratios(9.0, 3.0),
+            5.9
+        ));
+    }
+
+    #[test]
+    fn forward_similarity_allows_strict_hard_flash_without_return_candidate() {
+        let options = ForwardSimilarityOptions {
+            flash_return_without_candidate: true,
+            flash_return_frames: 40,
+            flash_return_min_cost_ratio: 1.0,
+            threshold_8bit: 6.0,
+            ..ForwardSimilarityOptions::default()
+        };
+        assert!(forward_similarity_flash_return_without_candidate_allowed(
+            options,
+            score_with_ratios(1.2, 3.0),
+            30,
+            5.9
+        ));
+        assert!(!forward_similarity_flash_return_without_candidate_allowed(
+            options,
+            score_with_ratios(0.9, 3.0),
+            30,
+            5.9
+        ));
+        assert!(!forward_similarity_flash_return_without_candidate_allowed(
+            options,
+            score_with_ratios(1.2, 3.0),
+            41,
+            5.9
+        ));
+        assert!(!forward_similarity_flash_return_without_candidate_allowed(
+            options,
+            score_with_ratios(1.2, 3.0),
+            30,
+            6.1
+        ));
     }
 }
 

@@ -20,6 +20,7 @@ pub const fn detection_option_override_names() -> &'static [&'static str] {
         "forward-similarity-min-cut-cost-ratio",
         "forward-similarity-relaxed-threshold",
         "forward-similarity-relaxed-min-cost-ratio",
+        "forward-similarity-relaxed-max-cost-ratio",
         "forward-similarity-relaxed-importance-min-cost-ratio",
         "forward-similarity-relaxed-min-imp-ratio",
         "forward-similarity-mask-percent",
@@ -67,6 +68,8 @@ pub enum DetectionOptionOverride {
     ForwardSimilarityRelaxedThreshold(f64),
     /// Sets the hard-cut ratio needed to use the relaxed threshold.
     ForwardSimilarityRelaxedMinCostRatio(f64),
+    /// Sets the maximum cut ratio allowed to use the relaxed threshold.
+    ForwardSimilarityRelaxedMaxCostRatio(f64),
     /// Sets the cost-ratio needed for importance cuts to use the relaxed
     /// threshold.
     ForwardSimilarityRelaxedImportanceMinCostRatio(f64),
@@ -137,6 +140,9 @@ impl DetectionOptionOverride {
             )),
             "forward-similarity-relaxed-min-cost-ratio" => Ok(
                 Self::ForwardSimilarityRelaxedMinCostRatio(parse_nonnegative_f64(name, value)?),
+            ),
+            "forward-similarity-relaxed-max-cost-ratio" => Ok(
+                Self::ForwardSimilarityRelaxedMaxCostRatio(parse_nonnegative_f64(name, value)?),
             ),
             "forward-similarity-relaxed-importance-min-cost-ratio" => {
                 Ok(Self::ForwardSimilarityRelaxedImportanceMinCostRatio(
@@ -289,6 +295,9 @@ impl DetectionOptions {
             }
             DetectionOptionOverride::ForwardSimilarityRelaxedMinCostRatio(ratio) => {
                 self.tuning.forward_similarity.relaxed_min_cost_ratio = ratio;
+            }
+            DetectionOptionOverride::ForwardSimilarityRelaxedMaxCostRatio(ratio) => {
+                self.tuning.forward_similarity.relaxed_max_cost_ratio = ratio;
             }
             DetectionOptionOverride::ForwardSimilarityRelaxedImportanceMinCostRatio(ratio) => {
                 self.tuning
@@ -474,6 +483,10 @@ mod tests {
         assert_eq!(
             "forward-similarity-relaxed-min-cost-ratio=1.0".parse(),
             Ok(DetectionOptionOverride::ForwardSimilarityRelaxedMinCostRatio(1.0))
+        );
+        assert_eq!(
+            "forward-similarity-relaxed-max-cost-ratio=3.0".parse(),
+            Ok(DetectionOptionOverride::ForwardSimilarityRelaxedMaxCostRatio(3.0))
         );
         assert_eq!(
             "forward-similarity-relaxed-importance-min-cost-ratio=0.45".parse(),

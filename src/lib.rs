@@ -178,6 +178,9 @@ pub struct DetectionTuning {
     pub importance_cut_min_cost_ratio: f64,
     /// Optional maximum luma, in 8-bit units, for importance-driven cuts.
     pub importance_cut_max_luma_8bit: Option<f64>,
+    /// Optional maximum cost ratio for importance cuts above
+    /// `importance_cut_dark_luma_high_8bit`.
+    pub importance_cut_bright_max_cost_ratio: f64,
     /// Lower importance ratio accepted when a cut starts after quiet blocks.
     pub importance_cut_relaxed_ratio: Option<f64>,
     /// Maximum amount subtracted from relaxed importance ratio in dark scenes.
@@ -195,6 +198,11 @@ pub struct DetectionTuning {
     pub importance_cut_relaxed_max_previous_ratio: f64,
     /// Minimum ME residual coverage that can support relaxed cuts.
     pub importance_cut_min_me_bad_ratio: f64,
+    /// Optional upper bound for well-matched ME blocks on importance cuts.
+    ///
+    /// High values usually mean localized motion, titles, or effects changed
+    /// sharply while most of the frame still tracks well.
+    pub importance_cut_max_me_good_ratio: f64,
     /// Optional A-B-A transient suppression.
     pub forward_similarity: ForwardSimilarityOptions,
     /// Optional two-sided masked similarity suppression for transient cuts.
@@ -216,6 +224,7 @@ impl Default for DetectionTuning {
             importance_cut_ratio: None,
             importance_cut_min_cost_ratio: 0.0,
             importance_cut_max_luma_8bit: None,
+            importance_cut_bright_max_cost_ratio: 0.0,
             importance_cut_relaxed_ratio: None,
             importance_cut_dark_ratio_boost: 0.0,
             importance_cut_dark_min_ratio: 0.0,
@@ -224,6 +233,7 @@ impl Default for DetectionTuning {
             importance_cut_relaxed_min_cost_ratio: 0.0,
             importance_cut_relaxed_max_previous_ratio: 2.2,
             importance_cut_min_me_bad_ratio: 0.0,
+            importance_cut_max_me_good_ratio: 0.0,
             forward_similarity: ForwardSimilarityOptions::default(),
             transient_similarity: TransientSimilarityOptions::default(),
         }
@@ -249,7 +259,8 @@ impl DetectionTuning {
             strong_cut_ratio: Some(2.5),
             importance_cut_ratio: Some(3.2),
             importance_cut_min_cost_ratio: 0.20,
-            importance_cut_max_luma_8bit: Some(60.0),
+            importance_cut_max_luma_8bit: Some(64.0),
+            importance_cut_bright_max_cost_ratio: 0.9,
             importance_cut_relaxed_ratio: Some(3.0),
             importance_cut_dark_ratio_boost: 0.65,
             importance_cut_dark_min_ratio: 2.35,
@@ -258,18 +269,25 @@ impl DetectionTuning {
             importance_cut_relaxed_min_cost_ratio: 0.08,
             importance_cut_relaxed_max_previous_ratio: 2.2,
             importance_cut_min_me_bad_ratio: 0.15,
+            importance_cut_max_me_good_ratio: 0.05,
             forward_similarity: ForwardSimilarityOptions {
                 enabled: true,
                 frames: 80,
                 window_frames: 3,
                 min_offset: 4,
                 threshold_8bit: 6.0,
-                min_previous_scene_len: 18,
+                min_previous_scene_len: 24,
                 min_cut_cost_ratio: 0.12,
-                relaxed_threshold_8bit: 7.5,
+                relaxed_threshold_8bit: 8.5,
                 relaxed_min_cost_ratio: 1.0,
+                relaxed_max_cost_ratio: 3.0,
                 relaxed_importance_min_cost_ratio: 0.45,
                 relaxed_min_imp_block_ratio: 3.6,
+                relaxed_max_return_cost_ratio: 2.5,
+                relaxed_max_return_cost_ratio_multiplier: 4.0,
+                flash_return_without_candidate: true,
+                flash_return_frames: 40,
+                flash_return_min_cost_ratio: 1.0,
                 mask_percent: 0.20,
                 mask_region_cols: 8,
                 mask_region_rows: 4,
@@ -382,6 +400,11 @@ pub struct ForwardSimilarityOptions {
     /// Cost ratio required to use the relaxed threshold unconditionally.
     #[cfg_attr(feature = "serialize", serde(default))]
     pub relaxed_min_cost_ratio: f64,
+    /// Maximum cut cost ratio that may use the relaxed threshold. Very large
+    /// ratios often come from flashes, explosions, or exposure shifts; keep
+    /// those on the strict threshold unless the visual match is already clear.
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub relaxed_max_cost_ratio: f64,
     /// Cost ratio required to use the relaxed threshold for strong
     /// importance-driven cuts.
     #[cfg_attr(feature = "serialize", serde(default))]
@@ -390,6 +413,26 @@ pub struct ForwardSimilarityOptions {
     /// importance-driven cuts.
     #[cfg_attr(feature = "serialize", serde(default))]
     pub relaxed_min_imp_block_ratio: f64,
+    /// Maximum return-candidate cost ratio accepted for relaxed matches unless
+    /// the return candidate is still proportionate to the starting cut.
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub relaxed_max_return_cost_ratio: f64,
+    /// Maximum return-candidate/start-cut cost ratio accepted for relaxed
+    /// matches whose return candidate is already above
+    /// `relaxed_max_return_cost_ratio`.
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub relaxed_max_return_cost_ratio_multiplier: f64,
+    /// Allows a strong hard cut to be suppressed as a short flash return even
+    /// when the detector did not find a separate future return-cut candidate.
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub flash_return_without_candidate: bool,
+    /// Maximum forward offset for flash returns without a return-cut candidate.
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub flash_return_frames: usize,
+    /// Minimum starting cut cost ratio for flash returns without a return-cut
+    /// candidate.
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub flash_return_min_cost_ratio: f64,
     /// Fraction of most volatile blocks to mask when checking the return.
     pub mask_percent: f64,
     /// Number of horizontal regions used to cap masked volatile blocks.
@@ -437,8 +480,14 @@ impl Default for ForwardSimilarityOptions {
             min_cut_cost_ratio: 0.0,
             relaxed_threshold_8bit: 0.0,
             relaxed_min_cost_ratio: 0.0,
+            relaxed_max_cost_ratio: 0.0,
             relaxed_importance_min_cost_ratio: 0.0,
             relaxed_min_imp_block_ratio: 0.0,
+            relaxed_max_return_cost_ratio: 0.0,
+            relaxed_max_return_cost_ratio_multiplier: 0.0,
+            flash_return_without_candidate: false,
+            flash_return_frames: 0,
+            flash_return_min_cost_ratio: 0.0,
             mask_percent: 0.0,
             mask_region_cols: 1,
             mask_region_rows: 1,
@@ -839,6 +888,19 @@ fn forward_similarity_postprocess_match(
                     forward_similarity_return_score_passed(*candidate_score)
                         .then_some(candidate_frame)
                 })?;
+            let post_start_frame = candidate.frame + 1 - options.window_frames.max(1);
+            if return_candidate_frame > post_start_frame {
+                return None;
+            }
+            let return_candidate_score = scores.get(&return_candidate_frame).copied()?;
+            if !analyze::forward_similarity_return_candidate_allowed(
+                options,
+                score,
+                return_candidate_score,
+                candidate.delta,
+            ) {
+                return None;
+            }
 
             Some(PostprocessForwardSimilarityMatch {
                 return_frame: candidate.frame,
