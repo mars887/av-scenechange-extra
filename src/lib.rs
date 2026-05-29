@@ -9,6 +9,7 @@ mod analyze;
 mod cpu;
 mod data;
 mod math;
+mod options;
 
 /// Hidden re-exports of internal items for benchmarking only.
 /// Not part of the stable public API.
@@ -40,12 +41,19 @@ pub use av_decoders::{self, Decoder};
 pub use num_rational::Rational32;
 use v_frame::pixel::Pixel;
 
-pub use crate::analyze::{
-    ForwardSimilarityCandidate,
-    ForwardSimilarityCandidateDecision,
-    SceneChangeDetector,
-    ScenecutDecision,
-    ScenecutResult,
+pub use crate::{
+    analyze::{
+        ForwardSimilarityCandidate,
+        ForwardSimilarityCandidateDecision,
+        SceneChangeDetector,
+        ScenecutDecision,
+        ScenecutResult,
+    },
+    options::{
+        DetectionOptionOverride,
+        ParseDetectionOptionOverrideError,
+        detection_option_override_names,
+    },
 };
 
 const FRAME_PREFETCH_DEPTH: usize = 8;
