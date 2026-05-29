@@ -16,6 +16,12 @@ pub const fn detection_option_override_names() -> &'static [&'static str] {
         "forward-similarity-window-frames",
         "forward-similarity-min-offset",
         "forward-similarity-threshold",
+        "forward-similarity-min-previous-scene-len",
+        "forward-similarity-min-cut-cost-ratio",
+        "forward-similarity-relaxed-threshold",
+        "forward-similarity-relaxed-min-cost-ratio",
+        "forward-similarity-relaxed-importance-min-cost-ratio",
+        "forward-similarity-relaxed-min-imp-ratio",
         "forward-similarity-mask-percent",
         "forward-similarity-mask-region-cols",
         "forward-similarity-mask-region-rows",
@@ -53,6 +59,19 @@ pub enum DetectionOptionOverride {
     ForwardSimilarityMinOffset(usize),
     /// Sets the accepted forward similarity segment delta in 8-bit units.
     ForwardSimilarityThreshold(f64),
+    /// Sets the minimum previous scene length required for suppression.
+    ForwardSimilarityMinPreviousSceneLen(usize),
+    /// Sets the minimum cut cost-ratio required for suppression.
+    ForwardSimilarityMinCutCostRatio(f64),
+    /// Sets the relaxed threshold for high-confidence cuts.
+    ForwardSimilarityRelaxedThreshold(f64),
+    /// Sets the hard-cut ratio needed to use the relaxed threshold.
+    ForwardSimilarityRelaxedMinCostRatio(f64),
+    /// Sets the cost-ratio needed for importance cuts to use the relaxed
+    /// threshold.
+    ForwardSimilarityRelaxedImportanceMinCostRatio(f64),
+    /// Sets the importance ratio needed to use the relaxed threshold.
+    ForwardSimilarityRelaxedMinImpRatio(f64),
     /// Sets the fraction of volatile blocks masked from forward similarity.
     ForwardSimilarityMaskPercent(f64),
     /// Sets horizontal regions used to cap forward-similarity masking.
@@ -107,6 +126,26 @@ impl DetectionOptionOverride {
             "forward-similarity-threshold" => Ok(Self::ForwardSimilarityThreshold(
                 parse_nonnegative_f64(name, value)?,
             )),
+            "forward-similarity-min-previous-scene-len" => Ok(
+                Self::ForwardSimilarityMinPreviousSceneLen(parse_usize(name, value)?),
+            ),
+            "forward-similarity-min-cut-cost-ratio" => Ok(Self::ForwardSimilarityMinCutCostRatio(
+                parse_nonnegative_f64(name, value)?,
+            )),
+            "forward-similarity-relaxed-threshold" => Ok(Self::ForwardSimilarityRelaxedThreshold(
+                parse_nonnegative_f64(name, value)?,
+            )),
+            "forward-similarity-relaxed-min-cost-ratio" => Ok(
+                Self::ForwardSimilarityRelaxedMinCostRatio(parse_nonnegative_f64(name, value)?),
+            ),
+            "forward-similarity-relaxed-importance-min-cost-ratio" => {
+                Ok(Self::ForwardSimilarityRelaxedImportanceMinCostRatio(
+                    parse_nonnegative_f64(name, value)?,
+                ))
+            }
+            "forward-similarity-relaxed-min-imp-ratio" => Ok(
+                Self::ForwardSimilarityRelaxedMinImpRatio(parse_nonnegative_f64(name, value)?),
+            ),
             "forward-similarity-mask-percent" => Ok(Self::ForwardSimilarityMaskPercent(
                 parse_percent(name, value)?,
             )),
@@ -238,6 +277,26 @@ impl DetectionOptions {
             }
             DetectionOptionOverride::ForwardSimilarityThreshold(threshold) => {
                 self.tuning.forward_similarity.threshold_8bit = threshold;
+            }
+            DetectionOptionOverride::ForwardSimilarityMinPreviousSceneLen(frames) => {
+                self.tuning.forward_similarity.min_previous_scene_len = frames;
+            }
+            DetectionOptionOverride::ForwardSimilarityMinCutCostRatio(ratio) => {
+                self.tuning.forward_similarity.min_cut_cost_ratio = ratio;
+            }
+            DetectionOptionOverride::ForwardSimilarityRelaxedThreshold(threshold) => {
+                self.tuning.forward_similarity.relaxed_threshold_8bit = threshold;
+            }
+            DetectionOptionOverride::ForwardSimilarityRelaxedMinCostRatio(ratio) => {
+                self.tuning.forward_similarity.relaxed_min_cost_ratio = ratio;
+            }
+            DetectionOptionOverride::ForwardSimilarityRelaxedImportanceMinCostRatio(ratio) => {
+                self.tuning
+                    .forward_similarity
+                    .relaxed_importance_min_cost_ratio = ratio;
+            }
+            DetectionOptionOverride::ForwardSimilarityRelaxedMinImpRatio(ratio) => {
+                self.tuning.forward_similarity.relaxed_min_imp_block_ratio = ratio;
             }
             DetectionOptionOverride::ForwardSimilarityMaskPercent(percent) => {
                 self.tuning.forward_similarity.mask_percent = percent;
@@ -395,6 +454,34 @@ mod tests {
         assert_eq!(
             "forward-similarity-window-frames=3".parse(),
             Ok(DetectionOptionOverride::ForwardSimilarityWindowFrames(3))
+        );
+        assert_eq!(
+            "forward-similarity-min-previous-scene-len=18".parse(),
+            Ok(DetectionOptionOverride::ForwardSimilarityMinPreviousSceneLen(18))
+        );
+        assert_eq!(
+            "forward-similarity-min-cut-cost-ratio=0.12".parse(),
+            Ok(DetectionOptionOverride::ForwardSimilarityMinCutCostRatio(
+                0.12
+            ))
+        );
+        assert_eq!(
+            "forward-similarity-relaxed-threshold=7.5".parse(),
+            Ok(DetectionOptionOverride::ForwardSimilarityRelaxedThreshold(
+                7.5
+            ))
+        );
+        assert_eq!(
+            "forward-similarity-relaxed-min-cost-ratio=1.0".parse(),
+            Ok(DetectionOptionOverride::ForwardSimilarityRelaxedMinCostRatio(1.0))
+        );
+        assert_eq!(
+            "forward-similarity-relaxed-importance-min-cost-ratio=0.45".parse(),
+            Ok(DetectionOptionOverride::ForwardSimilarityRelaxedImportanceMinCostRatio(0.45))
+        );
+        assert_eq!(
+            "forward-similarity-relaxed-min-imp-ratio=3.6".parse(),
+            Ok(DetectionOptionOverride::ForwardSimilarityRelaxedMinImpRatio(3.6))
         );
         assert_eq!(
             "forward-similarity-mask-region-cols=8".parse(),

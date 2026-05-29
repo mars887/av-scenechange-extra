@@ -341,7 +341,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
 
         // Adaptive scenecut check
         let (mut scenecut, mut score) =
-            self.adaptive_scenecut(frame_set, previous_frame_set, input_frameno);
+            self.adaptive_scenecut(frame_set, previous_frame_set, input_frameno, distance);
         if let Some(interval_decision) = self.handle_min_max_intervals(distance) {
             scenecut = interval_decision;
             score.decision = if interval_decision {
@@ -478,6 +478,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
         frame_set: &[&Arc<Frame<T>>],
         previous_frame_set: &[&Arc<Frame<T>>],
         input_frameno: usize,
+        previous_scene_len: usize,
     ) -> (bool, ScenecutResult) {
         for idx in 0..self.score_deque.len() {
             self.refresh_importance_metrics(idx);
@@ -584,8 +585,13 @@ impl<T: Pixel> SceneChangeDetector<T> {
         }
 
         if scenecut
+            && forward_similarity_start_allowed(
+                self.tuning.forward_similarity,
+                score,
+                previous_scene_len,
+            )
             && let Some(search) =
-                self.forward_similarity_search(frame_set, previous_frame_set, input_frameno)
+                self.forward_similarity_search(frame_set, previous_frame_set, input_frameno, score)
         {
             score.forward_similarity_candidates = search.candidates;
             score.forward_similarity_rejected_candidates = search.rejected_candidates;
@@ -862,6 +868,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
         frame_set: &[&Arc<Frame<T>>],
         previous_frame_set: &[&Arc<Frame<T>>],
         input_frameno: usize,
+        score: ScenecutResult,
     ) -> Option<ForwardSimilaritySearch> {
         let options = self.tuning.forward_similarity;
         let ForwardSimilarityOptions {
@@ -893,6 +900,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
             .saturating_add(1)
             .min(frame_set.len().saturating_sub(1));
         let min_offset = min_offset.max(2);
+        let threshold_8bit = forward_similarity_threshold_8bit(options, score);
         let mut candidates = [None; FORWARD_SIMILARITY_DIAGNOSTIC_SLOTS];
         let mut accepted = None;
         let mut rejected_candidates = 0usize;
@@ -916,7 +924,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
             );
             let decision = if require_return_candidate && return_candidate.is_none() {
                 ForwardSimilarityCandidateDecision::MissingReturnCandidate
-            } else if delta > options.threshold_8bit {
+            } else if delta > threshold_8bit {
                 ForwardSimilarityCandidateDecision::DeltaAboveThreshold
             } else {
                 ForwardSimilarityCandidateDecision::Accepted
@@ -925,7 +933,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 frame: input_frameno + offset - 1,
                 offset,
                 delta,
-                threshold: options.threshold_8bit,
+                threshold: threshold_8bit,
                 candidate_frame: return_candidate
                     .map(|candidate_offset| input_frameno + candidate_offset - 1),
                 candidate_offset: return_candidate,
@@ -1336,6 +1344,38 @@ impl<T: Pixel> SceneChangeDetector<T> {
     }
 }
 
+pub(crate) fn forward_similarity_start_allowed(
+    options: ForwardSimilarityOptions,
+    score: ScenecutResult,
+    previous_scene_len: usize,
+) -> bool {
+    previous_scene_len >= options.min_previous_scene_len
+        && score.cost_ratio >= options.min_cut_cost_ratio
+}
+
+pub(crate) fn forward_similarity_threshold_8bit(
+    options: ForwardSimilarityOptions,
+    score: ScenecutResult,
+) -> f64 {
+    let strict = options.threshold_8bit;
+    let relaxed = options.relaxed_threshold_8bit;
+    if relaxed <= strict {
+        return strict;
+    }
+
+    let hard_cut =
+        options.relaxed_min_cost_ratio > 0.0 && score.cost_ratio >= options.relaxed_min_cost_ratio;
+    let strong_importance_cut = options.relaxed_importance_min_cost_ratio > 0.0
+        && options.relaxed_min_imp_block_ratio > 0.0
+        && score.cost_ratio >= options.relaxed_importance_min_cost_ratio
+        && score.imp_block_ratio >= options.relaxed_min_imp_block_ratio;
+    if hard_cut || strong_importance_cut {
+        relaxed
+    } else {
+        strict
+    }
+}
+
 fn sample_range_scale(bit_depth: usize) -> f64 {
     (2.0_f64.powi(bit_depth as i32) - 1.0) / 255.0
 }
@@ -1374,6 +1414,66 @@ fn smoothstep_darkness(avg_luma_8bit: f64, low_luma_8bit: f64, high_luma_8bit: f
     }
     let t = ((high_luma_8bit - avg_luma_8bit) / (high_luma_8bit - low_luma_8bit)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn score_with_ratios(cost_ratio: f64, imp_block_ratio: f64) -> ScenecutResult {
+        let mut score = ScenecutResult::new(0.0, 0.0, 1.0, 1.0, 0.0);
+        score.cost_ratio = cost_ratio;
+        score.imp_block_ratio = imp_block_ratio;
+        score
+    }
+
+    #[test]
+    fn forward_similarity_start_gate_checks_previous_scene_and_cut_strength() {
+        let options = ForwardSimilarityOptions {
+            min_previous_scene_len: 18,
+            min_cut_cost_ratio: 0.12,
+            ..ForwardSimilarityOptions::default()
+        };
+        assert!(!forward_similarity_start_allowed(
+            options,
+            score_with_ratios(0.30, 3.0),
+            17
+        ));
+        assert!(!forward_similarity_start_allowed(
+            options,
+            score_with_ratios(0.10, 3.0),
+            30
+        ));
+        assert!(forward_similarity_start_allowed(
+            options,
+            score_with_ratios(0.30, 3.0),
+            30
+        ));
+    }
+
+    #[test]
+    fn forward_similarity_relaxes_threshold_only_for_confident_cuts() {
+        let options = ForwardSimilarityOptions {
+            threshold_8bit: 6.0,
+            relaxed_threshold_8bit: 7.5,
+            relaxed_min_cost_ratio: 1.0,
+            relaxed_importance_min_cost_ratio: 0.45,
+            relaxed_min_imp_block_ratio: 3.6,
+            ..ForwardSimilarityOptions::default()
+        };
+        assert_eq!(
+            forward_similarity_threshold_8bit(options, score_with_ratios(0.43, 3.2)),
+            6.0
+        );
+        assert_eq!(
+            forward_similarity_threshold_8bit(options, score_with_ratios(1.05, 3.2)),
+            7.5
+        );
+        assert_eq!(
+            forward_similarity_threshold_8bit(options, score_with_ratios(0.49, 3.7)),
+            7.5
+        );
+    }
 }
 
 fn record_forward_similarity_candidate(

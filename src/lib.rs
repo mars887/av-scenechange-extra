@@ -264,6 +264,12 @@ impl DetectionTuning {
                 window_frames: 3,
                 min_offset: 4,
                 threshold_8bit: 6.0,
+                min_previous_scene_len: 18,
+                min_cut_cost_ratio: 0.12,
+                relaxed_threshold_8bit: 7.5,
+                relaxed_min_cost_ratio: 1.0,
+                relaxed_importance_min_cost_ratio: 0.45,
+                relaxed_min_imp_block_ratio: 3.6,
                 mask_percent: 0.20,
                 mask_region_cols: 8,
                 mask_region_rows: 4,
@@ -360,6 +366,30 @@ pub struct ForwardSimilarityOptions {
     /// to the previous scene. Uses masked luma block comparison when
     /// `mask_percent` is non-zero and may include weighted chroma delta.
     pub threshold_8bit: f64,
+    /// Minimum length of the scene before the cut before forward similarity
+    /// can suppress the cut. This avoids treating very short pre-rolls as the
+    /// stable A side of an A-B-A pattern.
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub min_previous_scene_len: usize,
+    /// Minimum cost-ratio evidence required before forward similarity can
+    /// suppress a cut.
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub min_cut_cost_ratio: f64,
+    /// Optional relaxed segment similarity delta for high-confidence cuts.
+    /// A value of 0 disables the relaxed threshold.
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub relaxed_threshold_8bit: f64,
+    /// Cost ratio required to use the relaxed threshold unconditionally.
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub relaxed_min_cost_ratio: f64,
+    /// Cost ratio required to use the relaxed threshold for strong
+    /// importance-driven cuts.
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub relaxed_importance_min_cost_ratio: f64,
+    /// Importance ratio required to use the relaxed threshold for strong
+    /// importance-driven cuts.
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub relaxed_min_imp_block_ratio: f64,
     /// Fraction of most volatile blocks to mask when checking the return.
     pub mask_percent: f64,
     /// Number of horizontal regions used to cap masked volatile blocks.
@@ -403,6 +433,12 @@ impl Default for ForwardSimilarityOptions {
             window_frames: 1,
             min_offset: 2,
             threshold_8bit: 6.0,
+            min_previous_scene_len: 0,
+            min_cut_cost_ratio: 0.0,
+            relaxed_threshold_8bit: 0.0,
+            relaxed_min_cost_ratio: 0.0,
+            relaxed_importance_min_cost_ratio: 0.0,
+            relaxed_min_imp_block_ratio: 0.0,
             mask_percent: 0.0,
             mask_region_cols: 1,
             mask_region_rows: 1,
@@ -730,6 +766,10 @@ fn apply_forward_similarity_postprocess(
         ) {
             continue;
         }
+        let previous_frame = keyframes.range(..frame).next_back().copied().unwrap_or(0);
+        if !analyze::forward_similarity_start_allowed(options, score, frame - previous_frame) {
+            continue;
+        }
 
         let Some(similarity_match) =
             forward_similarity_postprocess_match(frame, options, score, scores)
@@ -776,12 +816,13 @@ fn forward_similarity_postprocess_match(
         .frames
         .saturating_add(options.window_frames.saturating_sub(1))
         .saturating_add(1);
+    let threshold = analyze::forward_similarity_threshold_8bit(options, score);
     score
         .forward_similarity_candidates
         .iter()
         .flatten()
         .filter(|candidate| {
-            candidate.delta <= candidate.threshold
+            candidate.delta <= threshold
                 && candidate.offset >= min_offset
                 && candidate.offset <= max_offset
                 && candidate.frame > frame
