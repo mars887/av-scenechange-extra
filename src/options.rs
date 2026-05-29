@@ -13,9 +13,13 @@ pub const fn detection_option_override_names() -> &'static [&'static str] {
         "fast-threshold-scale",
         "forward-similarity",
         "forward-similarity-frames",
+        "forward-similarity-window-frames",
         "forward-similarity-min-offset",
         "forward-similarity-threshold",
         "forward-similarity-mask-percent",
+        "forward-similarity-mask-region-cols",
+        "forward-similarity-mask-region-rows",
+        "forward-similarity-chroma-weight",
         "forward-similarity-require-return-candidate",
         "forward-similarity-suppress-inside",
         "transient-similarity",
@@ -43,12 +47,20 @@ pub enum DetectionOptionOverride {
     ForwardSimilarity(bool),
     /// Sets how many future frames forward similarity may inspect.
     ForwardSimilarityFrames(usize),
+    /// Sets how many frames are compared on each side of the transient segment.
+    ForwardSimilarityWindowFrames(usize),
     /// Sets the minimum forward offset accepted as a return frame.
     ForwardSimilarityMinOffset(usize),
-    /// Sets the accepted forward similarity luma delta in 8-bit units.
+    /// Sets the accepted forward similarity segment delta in 8-bit units.
     ForwardSimilarityThreshold(f64),
     /// Sets the fraction of volatile blocks masked from forward similarity.
     ForwardSimilarityMaskPercent(f64),
+    /// Sets horizontal regions used to cap forward-similarity masking.
+    ForwardSimilarityMaskRegionCols(usize),
+    /// Sets vertical regions used to cap forward-similarity masking.
+    ForwardSimilarityMaskRegionRows(usize),
+    /// Sets the chroma delta weight added to forward-similarity scoring.
+    ForwardSimilarityChromaWeight(f64),
     /// Requires a plausible future cut candidate before accepting a return.
     ForwardSimilarityRequireReturnCandidate(bool),
     /// Suppresses additional cuts until the matched forward return frame.
@@ -86,6 +98,9 @@ impl DetectionOptionOverride {
             "forward-similarity-frames" => {
                 Ok(Self::ForwardSimilarityFrames(parse_usize(name, value)?))
             }
+            "forward-similarity-window-frames" => Ok(Self::ForwardSimilarityWindowFrames(
+                parse_positive_usize(name, value)?,
+            )),
             "forward-similarity-min-offset" => {
                 Ok(Self::ForwardSimilarityMinOffset(parse_usize(name, value)?))
             }
@@ -94,6 +109,15 @@ impl DetectionOptionOverride {
             )),
             "forward-similarity-mask-percent" => Ok(Self::ForwardSimilarityMaskPercent(
                 parse_percent(name, value)?,
+            )),
+            "forward-similarity-mask-region-cols" => Ok(Self::ForwardSimilarityMaskRegionCols(
+                parse_positive_usize(name, value)?,
+            )),
+            "forward-similarity-mask-region-rows" => Ok(Self::ForwardSimilarityMaskRegionRows(
+                parse_positive_usize(name, value)?,
+            )),
+            "forward-similarity-chroma-weight" => Ok(Self::ForwardSimilarityChromaWeight(
+                parse_nonnegative_f64(name, value)?,
             )),
             "forward-similarity-require-return-candidate" => Ok(
                 Self::ForwardSimilarityRequireReturnCandidate(parse_bool(name, value)?),
@@ -206,6 +230,9 @@ impl DetectionOptions {
             DetectionOptionOverride::ForwardSimilarityFrames(frames) => {
                 self.tuning.forward_similarity.frames = frames;
             }
+            DetectionOptionOverride::ForwardSimilarityWindowFrames(frames) => {
+                self.tuning.forward_similarity.window_frames = frames;
+            }
             DetectionOptionOverride::ForwardSimilarityMinOffset(offset) => {
                 self.tuning.forward_similarity.min_offset = offset;
             }
@@ -214,6 +241,15 @@ impl DetectionOptions {
             }
             DetectionOptionOverride::ForwardSimilarityMaskPercent(percent) => {
                 self.tuning.forward_similarity.mask_percent = percent;
+            }
+            DetectionOptionOverride::ForwardSimilarityMaskRegionCols(cols) => {
+                self.tuning.forward_similarity.mask_region_cols = cols;
+            }
+            DetectionOptionOverride::ForwardSimilarityMaskRegionRows(rows) => {
+                self.tuning.forward_similarity.mask_region_rows = rows;
+            }
+            DetectionOptionOverride::ForwardSimilarityChromaWeight(weight) => {
+                self.tuning.forward_similarity.chroma_weight = weight;
             }
             DetectionOptionOverride::ForwardSimilarityRequireReturnCandidate(required) => {
                 self.tuning.forward_similarity.require_return_candidate = required;
@@ -355,6 +391,22 @@ mod tests {
         assert_eq!(
             "forward-similarity-frames=40".parse(),
             Ok(DetectionOptionOverride::ForwardSimilarityFrames(40))
+        );
+        assert_eq!(
+            "forward-similarity-window-frames=3".parse(),
+            Ok(DetectionOptionOverride::ForwardSimilarityWindowFrames(3))
+        );
+        assert_eq!(
+            "forward-similarity-mask-region-cols=8".parse(),
+            Ok(DetectionOptionOverride::ForwardSimilarityMaskRegionCols(8))
+        );
+        assert_eq!(
+            "forward-similarity-mask-region-rows=4".parse(),
+            Ok(DetectionOptionOverride::ForwardSimilarityMaskRegionRows(4))
+        );
+        assert_eq!(
+            "forward-similarity-chroma-weight=0.25".parse(),
+            Ok(DetectionOptionOverride::ForwardSimilarityChromaWeight(0.25))
         );
         assert_eq!(
             "fast-threshold-scale=sample-range".parse(),

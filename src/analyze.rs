@@ -167,6 +167,14 @@ pub struct SceneChangeDetector<T: Pixel> {
     score_deque: Vec<ScenecutAnalysis>,
     /// Suppresses additional cuts while an A-B-A transient is active.
     forward_suppress_until: Option<usize>,
+    /// Reused per-block deltas for masked forward/transient similarity.
+    similarity_block_deltas: Vec<f64>,
+    /// Reused mask for spatially capped volatile blocks.
+    similarity_block_mask: Vec<bool>,
+    /// Reused block indices for spatially capped volatile-block selection.
+    similarity_block_indices: Vec<usize>,
+    /// Reused per-region masked block counts.
+    similarity_region_counts: Vec<usize>,
     /// Temporary buffer used by `estimate_intra_costs`.
     /// We store it on the struct so we only need to allocate it once.
     temp_plane: Option<Plane<T>>,
@@ -233,6 +241,10 @@ impl<T: Pixel> SceneChangeDetector<T> {
             deque_offset,
             score_deque,
             forward_suppress_until: None,
+            similarity_block_deltas: Vec::new(),
+            similarity_block_mask: Vec::new(),
+            similarity_block_indices: Vec::new(),
+            similarity_region_counts: Vec::new(),
             scaled_pixels: pixels,
             bit_depth,
             frame_rate,
@@ -571,7 +583,10 @@ impl<T: Pixel> SceneChangeDetector<T> {
             scenecut = false;
         }
 
-        if scenecut && let Some(search) = self.forward_similarity_search(frame_set, input_frameno) {
+        if scenecut
+            && let Some(search) =
+                self.forward_similarity_search(frame_set, previous_frame_set, input_frameno)
+        {
             score.forward_similarity_candidates = search.candidates;
             score.forward_similarity_rejected_candidates = search.rejected_candidates;
             if let Some(return_frame) = search.accepted {
@@ -843,38 +858,65 @@ impl<T: Pixel> SceneChangeDetector<T> {
     }
 
     fn forward_similarity_search(
-        &self,
+        &mut self,
         frame_set: &[&Arc<Frame<T>>],
+        previous_frame_set: &[&Arc<Frame<T>>],
         input_frameno: usize,
     ) -> Option<ForwardSimilaritySearch> {
+        let options = self.tuning.forward_similarity;
         let ForwardSimilarityOptions {
             enabled,
             frames,
+            window_frames,
             min_offset,
-            threshold_8bit,
-            mask_percent,
             require_return_candidate,
             ..
-        } = self.tuning.forward_similarity;
+        } = options;
         if !enabled || frames == 0 || frame_set.len() < 3 {
             return None;
         }
 
-        let max_offset = frames.min(frame_set.len().saturating_sub(2));
+        let window_frames = window_frames.max(1);
+        let mut reference_window = previous_frame_set
+            .iter()
+            .copied()
+            .rev()
+            .take(window_frames)
+            .collect::<Vec<_>>();
+        reference_window.reverse();
+        if reference_window.is_empty() {
+            reference_window.push(frame_set[0]);
+        }
+
+        let max_offset = frames
+            .saturating_add(window_frames.saturating_sub(1))
+            .saturating_add(1)
+            .min(frame_set.len().saturating_sub(1));
         let min_offset = min_offset.max(2);
         let mut candidates = [None; FORWARD_SIMILARITY_DIAGNOSTIC_SLOTS];
         let mut accepted = None;
         let mut rejected_candidates = 0usize;
-        for offset in min_offset..=max_offset + 1 {
+        for offset in min_offset..=max_offset {
             let return_candidate = self.forward_return_candidate(min_offset, offset);
-            let delta = if mask_percent > 0.0 {
-                self.masked_luma_delta_8bit(frame_set[0], frame_set[offset], mask_percent)
-            } else {
-                self.luma_delta_8bit(frame_set[0], frame_set[offset])
+
+            let Some(post_start_offset) = self.forward_similarity_post_start_offset(
+                offset,
+                return_candidate,
+                reference_window.len(),
+            ) else {
+                rejected_candidates += 1;
+                continue;
             };
+            let delta = self.forward_segment_similarity_delta_8bit(
+                &reference_window,
+                frame_set,
+                post_start_offset,
+                offset,
+                options,
+            );
             let decision = if require_return_candidate && return_candidate.is_none() {
                 ForwardSimilarityCandidateDecision::MissingReturnCandidate
-            } else if delta > threshold_8bit {
+            } else if delta > options.threshold_8bit {
                 ForwardSimilarityCandidateDecision::DeltaAboveThreshold
             } else {
                 ForwardSimilarityCandidateDecision::Accepted
@@ -883,7 +925,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 frame: input_frameno + offset - 1,
                 offset,
                 delta,
-                threshold: threshold_8bit,
+                threshold: options.threshold_8bit,
                 candidate_frame: return_candidate
                     .map(|candidate_offset| input_frameno + candidate_offset - 1),
                 candidate_offset: return_candidate,
@@ -906,6 +948,68 @@ impl<T: Pixel> SceneChangeDetector<T> {
         })
     }
 
+    fn forward_similarity_post_start_offset(
+        &self,
+        return_offset: usize,
+        return_candidate: Option<usize>,
+        comparison_frames: usize,
+    ) -> Option<usize> {
+        if comparison_frames == 0 || return_offset < comparison_frames {
+            return None;
+        }
+
+        let post_start_offset = return_offset + 1 - comparison_frames;
+        if post_start_offset == 0 {
+            return None;
+        }
+        if let Some(return_candidate) = return_candidate
+            && post_start_offset < return_candidate
+        {
+            return None;
+        }
+        Some(post_start_offset)
+    }
+
+    fn forward_segment_similarity_delta_8bit(
+        &mut self,
+        reference_window: &[&Arc<Frame<T>>],
+        frame_set: &[&Arc<Frame<T>>],
+        post_start_offset: usize,
+        post_end_offset: usize,
+        options: ForwardSimilarityOptions,
+    ) -> f64 {
+        let comparison_frames = reference_window
+            .len()
+            .min(post_end_offset + 1 - post_start_offset);
+        if comparison_frames == 0 {
+            return f64::MAX;
+        }
+
+        let reference_start = reference_window.len() - comparison_frames;
+        let mut lower_bound = 0.0;
+        for idx in 0..comparison_frames {
+            lower_bound += self.frame_similarity_lower_bound_8bit(
+                reference_window[reference_start + idx],
+                frame_set[post_start_offset + idx],
+                options,
+            );
+        }
+        lower_bound /= comparison_frames as f64;
+        if options.mask_percent <= 0.0 || lower_bound > options.threshold_8bit {
+            return lower_bound;
+        }
+
+        let mut delta = 0.0;
+        for idx in 0..comparison_frames {
+            delta += self.frame_similarity_delta_8bit(
+                reference_window[reference_start + idx],
+                frame_set[post_start_offset + idx],
+                options,
+            );
+        }
+        delta / comparison_frames as f64
+    }
+
     fn forward_return_candidate(&self, min_offset: usize, return_offset: usize) -> Option<usize> {
         (min_offset..=return_offset)
             .rev()
@@ -925,7 +1029,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
     }
 
     fn two_sided_masked_similarity(
-        &self,
+        &mut self,
         previous_frame_set: &[&Arc<Frame<T>>],
         frame_set: &[&Arc<Frame<T>>],
     ) -> Option<f64> {
@@ -944,7 +1048,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
         let mut best = f64::MAX;
         for pre_frame in &previous_frame_set[pre_start..] {
             for post_frame in frame_set.iter().skip(1).take(post_count) {
-                let delta = self.masked_luma_delta_8bit(pre_frame, post_frame, mask_percent);
+                let delta = self.masked_luma_delta_8bit(pre_frame, post_frame, mask_percent, 1, 1);
                 if delta < best {
                     best = delta;
                 }
@@ -966,11 +1070,112 @@ impl<T: Pixel> SceneChangeDetector<T> {
         threshold_8bit + (dark_threshold_8bit - threshold_8bit) * darkness
     }
 
-    fn masked_luma_delta_8bit(
+    fn frame_similarity_lower_bound_8bit(
         &self,
         frame1: &Arc<Frame<T>>,
         frame2: &Arc<Frame<T>>,
+        options: ForwardSimilarityOptions,
+    ) -> f64 {
+        let luma_delta = self.luma_delta_8bit(frame1, frame2);
+        let luma_lower_bound = masked_delta_lower_bound_8bit(luma_delta, options.mask_percent);
+        luma_lower_bound + self.weighted_chroma_delta_8bit(frame1, frame2, options.chroma_weight)
+    }
+
+    fn frame_similarity_delta_8bit(
+        &mut self,
+        frame1: &Arc<Frame<T>>,
+        frame2: &Arc<Frame<T>>,
+        options: ForwardSimilarityOptions,
+    ) -> f64 {
+        let luma_delta = if options.mask_percent > 0.0 {
+            self.masked_luma_delta_8bit(
+                frame1,
+                frame2,
+                options.mask_percent,
+                options.mask_region_cols,
+                options.mask_region_rows,
+            )
+        } else {
+            self.luma_delta_8bit(frame1, frame2)
+        };
+        luma_delta + self.weighted_chroma_delta_8bit(frame1, frame2, options.chroma_weight)
+    }
+
+    fn weighted_chroma_delta_8bit(
+        &self,
+        frame1: &Arc<Frame<T>>,
+        frame2: &Arc<Frame<T>>,
+        chroma_weight: f64,
+    ) -> f64 {
+        let chroma_weight = chroma_weight.max(0.0);
+        if chroma_weight == 0.0 {
+            0.0
+        } else {
+            self.chroma_delta_8bit(frame1, frame2) * chroma_weight
+        }
+    }
+
+    fn chroma_delta_8bit(&self, frame1: &Arc<Frame<T>>, frame2: &Arc<Frame<T>>) -> f64 {
+        let mut total = 0.0;
+        let mut planes = 0usize;
+        if let (Some(plane1), Some(plane2)) = (&frame1.u_plane, &frame2.u_plane)
+            && let Some(delta) = self.plane_delta_8bit(plane1, plane2)
+        {
+            total += delta;
+            planes += 1;
+        }
+        if let (Some(plane1), Some(plane2)) = (&frame1.v_plane, &frame2.v_plane)
+            && let Some(delta) = self.plane_delta_8bit(plane1, plane2)
+        {
+            total += delta;
+            planes += 1;
+        }
+
+        if planes == 0 {
+            0.0
+        } else {
+            total / planes as f64
+        }
+    }
+
+    fn plane_delta_8bit(&self, plane1: &Plane<T>, plane2: &Plane<T>) -> Option<f64> {
+        let width = plane1.width().get().min(plane2.width().get());
+        let height = plane1.height().get().min(plane2.height().get());
+        let pixels = width * height;
+        if pixels == 0 {
+            return None;
+        }
+        let scale = sample_range_scale(self.bit_depth);
+        if plane1.width() == plane2.width() && plane1.height() == plane2.height() {
+            return Some(sad_plane(plane1, plane2) as f64 / pixels as f64 / scale);
+        }
+
+        let stride1 = plane1.geometry().stride.get();
+        let stride2 = plane2.geometry().stride.get();
+        let origin1 = plane1.data_origin();
+        let origin2 = plane2.data_origin();
+        let data1 = plane1.data();
+        let data2 = plane2.data();
+        let mut total = 0.0;
+        for y in 0..height {
+            for x in 0..width {
+                let idx1 = origin1 + y * stride1 + x;
+                let idx2 = origin2 + y * stride2 + x;
+                let p1 = data1[idx1].to_u16().expect("pixel value should fit in u16");
+                let p2 = data2[idx2].to_u16().expect("pixel value should fit in u16");
+                total += (p1 as f64 - p2 as f64).abs();
+            }
+        }
+        Some(total / pixels as f64 / scale)
+    }
+
+    fn masked_luma_delta_8bit(
+        &mut self,
+        frame1: &Arc<Frame<T>>,
+        frame2: &Arc<Frame<T>>,
         mask_percent: f64,
+        mask_region_cols: usize,
+        mask_region_rows: usize,
     ) -> f64 {
         const BLOCK_SIZE: usize = 32;
         const SAMPLE_STEP: usize = 4;
@@ -992,7 +1197,8 @@ impl<T: Pixel> SceneChangeDetector<T> {
         let data1 = plane1.data();
         let data2 = plane2.data();
         let scale = sample_range_scale(self.bit_depth);
-        let mut block_deltas = Vec::with_capacity(cols * rows);
+        self.similarity_block_deltas.clear();
+        self.similarity_block_deltas.reserve(cols * rows);
 
         for by in 0..rows {
             for bx in 0..cols {
@@ -1010,16 +1216,114 @@ impl<T: Pixel> SceneChangeDetector<T> {
                         count += 1;
                     }
                 }
-                block_deltas.push(total / count as f64 / scale);
+                self.similarity_block_deltas
+                    .push(total / count as f64 / scale);
             }
         }
 
-        block_deltas.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let keep = ((block_deltas.len() as f64 * (1.0 - mask_percent.clamp(0.0, 0.95))).ceil()
-            as usize)
+        self.masked_block_delta_mean(cols, rows, mask_percent, mask_region_cols, mask_region_rows)
+    }
+
+    fn masked_block_delta_mean(
+        &mut self,
+        cols: usize,
+        rows: usize,
+        mask_percent: f64,
+        mask_region_cols: usize,
+        mask_region_rows: usize,
+    ) -> f64 {
+        let block_count = self.similarity_block_deltas.len();
+        if block_count == 0 {
+            return 0.0;
+        }
+
+        let mask_percent = mask_percent.clamp(0.0, 0.95);
+        let keep = ((block_count as f64 * (1.0 - mask_percent)).ceil() as usize)
             .max(1)
-            .min(block_deltas.len());
-        block_deltas.iter().take(keep).sum::<f64>() / keep as f64
+            .min(block_count);
+        if keep == block_count {
+            return self.similarity_block_deltas.iter().sum::<f64>() / block_count as f64;
+        }
+
+        if mask_region_cols <= 1 && mask_region_rows <= 1 {
+            self.similarity_block_deltas
+                .select_nth_unstable_by(keep - 1, |a, b| {
+                    a.partial_cmp(b).unwrap_or(cmp::Ordering::Equal)
+                });
+            return self.similarity_block_deltas[..keep].iter().sum::<f64>() / keep as f64;
+        }
+
+        self.spatially_capped_masked_block_delta_mean(
+            cols,
+            rows,
+            mask_percent,
+            mask_region_cols,
+            mask_region_rows,
+        )
+    }
+
+    fn spatially_capped_masked_block_delta_mean(
+        &mut self,
+        cols: usize,
+        rows: usize,
+        mask_percent: f64,
+        mask_region_cols: usize,
+        mask_region_rows: usize,
+    ) -> f64 {
+        let block_count = self.similarity_block_deltas.len();
+        let target_mask = ((block_count as f64 * mask_percent).ceil() as usize)
+            .min(block_count.saturating_sub(1));
+        if target_mask == 0 {
+            return self.similarity_block_deltas.iter().sum::<f64>() / block_count as f64;
+        }
+
+        let region_cols = mask_region_cols.clamp(1, cols);
+        let region_rows = mask_region_rows.clamp(1, rows);
+        let region_count = region_cols * region_rows;
+        let per_region_cap = target_mask.div_ceil(region_count).max(1);
+
+        self.similarity_block_mask.clear();
+        self.similarity_block_mask.resize(block_count, false);
+        self.similarity_block_indices.clear();
+        self.similarity_block_indices.extend(0..block_count);
+        self.similarity_region_counts.clear();
+        self.similarity_region_counts.resize(region_count, 0);
+
+        let block_deltas = &self.similarity_block_deltas;
+        self.similarity_block_indices.sort_unstable_by(|&a, &b| {
+            block_deltas[b]
+                .partial_cmp(&block_deltas[a])
+                .unwrap_or(cmp::Ordering::Equal)
+        });
+
+        let mut masked = 0usize;
+        for index_idx in 0..self.similarity_block_indices.len() {
+            if masked == target_mask {
+                break;
+            }
+            let block_idx = self.similarity_block_indices[index_idx];
+            let region_idx = block_region_index(block_idx, cols, rows, region_cols, region_rows);
+            if self.similarity_region_counts[region_idx] >= per_region_cap {
+                continue;
+            }
+            self.similarity_block_mask[block_idx] = true;
+            self.similarity_region_counts[region_idx] += 1;
+            masked += 1;
+        }
+
+        let mut total = 0.0;
+        let mut kept = 0usize;
+        for (idx, &delta) in self.similarity_block_deltas.iter().enumerate() {
+            if !self.similarity_block_mask[idx] {
+                total += delta;
+                kept += 1;
+            }
+        }
+        if kept == 0 {
+            self.similarity_block_deltas.iter().sum::<f64>() / block_count as f64
+        } else {
+            total / kept as f64
+        }
     }
 
     fn luma_delta_8bit(&self, frame1: &Arc<Frame<T>>, frame2: &Arc<Frame<T>>) -> f64 {
@@ -1034,6 +1338,34 @@ impl<T: Pixel> SceneChangeDetector<T> {
 
 fn sample_range_scale(bit_depth: usize) -> f64 {
     (2.0_f64.powi(bit_depth as i32) - 1.0) / 255.0
+}
+
+fn masked_delta_lower_bound_8bit(delta_8bit: f64, mask_percent: f64) -> f64 {
+    let mask_percent = mask_percent.clamp(0.0, 0.95);
+    if mask_percent == 0.0 {
+        return delta_8bit;
+    }
+
+    ((delta_8bit - mask_percent * 255.0) / (1.0 - mask_percent)).max(0.0)
+}
+
+fn block_region_index(
+    block_idx: usize,
+    cols: usize,
+    rows: usize,
+    region_cols: usize,
+    region_rows: usize,
+) -> usize {
+    debug_assert!(cols > 0);
+    debug_assert!(rows > 0);
+    debug_assert!(region_cols > 0);
+    debug_assert!(region_rows > 0);
+
+    let bx = block_idx % cols;
+    let by = block_idx / cols;
+    let region_x = (bx * region_cols / cols).min(region_cols - 1);
+    let region_y = (by * region_rows / rows).min(region_rows - 1);
+    region_y * region_cols + region_x
 }
 
 fn smoothstep_darkness(avg_luma_8bit: f64, low_luma_8bit: f64, high_luma_8bit: f64) -> f64 {

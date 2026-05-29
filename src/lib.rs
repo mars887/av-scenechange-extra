@@ -127,7 +127,14 @@ impl DetectionOptions {
         };
         if self.tuning.forward_similarity.enabled {
             flash_lookahead
-                .max(self.tuning.forward_similarity.frames)
+                .max(
+                    self.tuning.forward_similarity.frames.saturating_add(
+                        self.tuning
+                            .forward_similarity
+                            .window_frames
+                            .saturating_sub(1),
+                    ),
+                )
                 .max(if self.tuning.transient_similarity.enabled {
                     self.tuning.transient_similarity.frames
                 } else {
@@ -254,9 +261,13 @@ impl DetectionTuning {
             forward_similarity: ForwardSimilarityOptions {
                 enabled: true,
                 frames: 80,
+                window_frames: 3,
                 min_offset: 4,
                 threshold_8bit: 6.0,
                 mask_percent: 0.20,
+                mask_region_cols: 8,
+                mask_region_rows: 4,
+                chroma_weight: 0.25,
                 require_return_candidate: true,
                 suppress_inside: true,
             },
@@ -334,15 +345,38 @@ pub struct ForwardSimilarityOptions {
     pub enabled: bool,
     /// Number of future frames to inspect.
     pub frames: usize,
+    /// Number of frames to compare on each side of the transient segment.
+    /// A value of 1 preserves the legacy single-frame comparison.
+    #[cfg_attr(
+        feature = "serialize",
+        serde(default = "default_forward_similarity_window_frames")
+    )]
+    pub window_frames: usize,
     /// Minimum future offset before a frame can be accepted as a return. This
     /// avoids suppressing hard cuts just because one of the next few frames is
     /// still visually similar to the previous scene.
     pub min_offset: usize,
-    /// Maximum luma delta, in 8-bit units, considered a return to the previous
-    /// scene. Uses masked block comparison when `mask_percent` is non-zero.
+    /// Maximum segment similarity delta, in 8-bit units, considered a return
+    /// to the previous scene. Uses masked luma block comparison when
+    /// `mask_percent` is non-zero and may include weighted chroma delta.
     pub threshold_8bit: f64,
     /// Fraction of most volatile blocks to mask when checking the return.
     pub mask_percent: f64,
+    /// Number of horizontal regions used to cap masked volatile blocks.
+    #[cfg_attr(
+        feature = "serialize",
+        serde(default = "default_forward_similarity_mask_region")
+    )]
+    pub mask_region_cols: usize,
+    /// Number of vertical regions used to cap masked volatile blocks.
+    #[cfg_attr(
+        feature = "serialize",
+        serde(default = "default_forward_similarity_mask_region")
+    )]
+    pub mask_region_rows: usize,
+    /// Extra chroma delta weight added to the luma similarity score.
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub chroma_weight: f64,
     /// Only accept a return frame if there is also a plausible future cut
     /// candidate before that return. This keeps A-B-A suppression
     /// segment-aware while allowing the best matching return frame to be a
@@ -352,15 +386,27 @@ pub struct ForwardSimilarityOptions {
     pub suppress_inside: bool,
 }
 
+const fn default_forward_similarity_window_frames() -> usize {
+    1
+}
+
+const fn default_forward_similarity_mask_region() -> usize {
+    1
+}
+
 impl Default for ForwardSimilarityOptions {
     #[inline]
     fn default() -> Self {
         Self {
             enabled: false,
             frames: 0,
+            window_frames: 1,
             min_offset: 2,
             threshold_8bit: 6.0,
             mask_percent: 0.0,
+            mask_region_cols: 1,
+            mask_region_rows: 1,
+            chroma_weight: 0.0,
             require_return_candidate: false,
             suppress_inside: false,
         }
@@ -479,6 +525,15 @@ pub fn detect_scene_changes<T: Pixel>(
     } else {
         0
     };
+    let forward_similarity_history = if opts.tuning.forward_similarity.enabled {
+        opts.tuning
+            .forward_similarity
+            .window_frames
+            .saturating_sub(1)
+    } else {
+        0
+    };
+    let frame_history = transient_history.max(forward_similarity_history);
     assert!(effective_lookahead >= 1);
 
     let detector = new_detector::<T>(dec, opts)?;
@@ -530,7 +585,7 @@ pub fn detect_scene_changes<T: Pixel>(
                     keyframes.insert(frameno);
                 } else {
                     let previous_frame_set = frame_queue
-                        .range(frameno.saturating_sub(transient_history + 1)..frameno)
+                        .range(frameno.saturating_sub(frame_history.saturating_add(1))..frameno)
                         .map(|(_, frame)| frame)
                         .collect::<Vec<_>>();
                     let (cut, score) = detector.analyze_next_frame_with_history(
@@ -550,7 +605,7 @@ pub fn detect_scene_changes<T: Pixel>(
                     }
                 }
 
-                let remove_before = frameno.saturating_sub(transient_history + 1);
+                let remove_before = frameno.saturating_sub(frame_history.saturating_add(1));
                 while frame_queue
                     .keys()
                     .next()
@@ -717,6 +772,10 @@ fn forward_similarity_postprocess_match(
     scores: &BTreeMap<usize, ScenecutResult>,
 ) -> Option<PostprocessForwardSimilarityMatch> {
     let min_offset = options.min_offset.max(2);
+    let max_offset = options
+        .frames
+        .saturating_add(options.window_frames.saturating_sub(1))
+        .saturating_add(1);
     score
         .forward_similarity_candidates
         .iter()
@@ -724,7 +783,7 @@ fn forward_similarity_postprocess_match(
         .filter(|candidate| {
             candidate.delta <= candidate.threshold
                 && candidate.offset >= min_offset
-                && candidate.offset <= options.frames + 1
+                && candidate.offset <= max_offset
                 && candidate.frame > frame
         })
         .filter_map(|candidate| {

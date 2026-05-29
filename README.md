@@ -46,13 +46,13 @@ adds opt-in tuning:
   background remains similar across the candidate boundary. The suppression
   threshold is also luma-adaptive so dark scenes are less likely to lose real
   cuts just because masked backgrounds are naturally similar.
-- Forward similarity now looks farther ahead in high mode and can use masked
-  comparison to suppress short A-B-A returns as one transient segment instead
-  of cutting around the short middle scene. In high mode, the matched return
-  frame must be far enough from the candidate and must occur after another
-  plausible cut candidate, preventing suppression from a merely similar
-  adjacent frame while still allowing stable interior frames after the return
-  boundary to close A-B-A and A-B-A-C-A chains.
+- Forward similarity now uses segment-level multi-frame windows in high mode:
+  frames before the candidate boundary are compared with frames after the
+  matched return boundary, so short A-B-A returns can be suppressed as one
+  transient segment instead of being decided by a single lucky frame. The
+  masked comparison can include weighted chroma delta, caps masked volatile
+  blocks per spatial region, and keeps a fast lower-bound precheck before
+  running the detailed masked block pass.
 - Motion-estimation residual coverage is exposed as bad/good block ratios and
   used as additional evidence for relaxed dark-scene importance cuts.
 - Per-frame diagnostics in `ScenecutResult`, including cost ratios,
