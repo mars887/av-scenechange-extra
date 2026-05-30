@@ -57,6 +57,7 @@ pub use crate::{
 };
 
 const FRAME_PREFETCH_DEPTH: usize = 8;
+const FINALIZED_BATCH_MIN_FRAMES: usize = 16;
 /// Version marker for diagnostics fields emitted by this fork.
 pub const DIAGNOSTICS_VERSION: &str = "av-scenechange-extra-forward-postprocess-diagnostics-v1";
 
@@ -549,6 +550,31 @@ pub struct DetectionResults {
     pub speed: f64,
 }
 
+/// A finalized scene-detection frame emitted by the streaming callback.
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+pub struct FinalizedDetectionFrame {
+    /// The 0-indexed frame number.
+    pub frame: usize,
+    /// The score for this frame, if the detector evaluated one.
+    pub score: Option<ScenecutResult>,
+    /// Whether this frame is a scene-change/keyframe after postprocessing.
+    pub is_scene_change: bool,
+}
+
+/// A contiguous finalized prefix range from scene detection.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
+pub struct FinalizedDetectionBatch {
+    /// Inclusive start of the finalized range.
+    pub start_frame: usize,
+    /// Exclusive end of the finalized range.
+    pub end_frame: usize,
+    /// Finalized frames in the range that have either a score or scene
+    /// boundary.
+    pub frames: Vec<FinalizedDetectionFrame>,
+}
+
 /// # Errors
 ///
 /// - If using a Vapoursynth script that contains an unsupported video format.
@@ -604,6 +630,43 @@ pub fn detect_scene_changes<T: Pixel>(
     frame_limit: Option<usize>,
     progress_callback: Option<&dyn Fn(usize, usize)>,
 ) -> anyhow::Result<DetectionResults> {
+    detect_scene_changes_with_finalized_callback::<T>(
+        dec,
+        opts,
+        frame_limit,
+        progress_callback,
+        None,
+    )
+}
+
+/// Runs through a y4m video clip, detecting scene changes and optionally
+/// emitting finalized prefix batches while detection is still running.
+///
+/// The finalized callback receives contiguous ranges that are far enough behind
+/// the detector lookahead that subsequent frames cannot change their scores or
+/// keyframe decisions. The emitted batches contain enough data to reconstruct
+/// the returned `scene_changes` and `scores`; `speed` is only available at the
+/// end.
+///
+/// # Errors
+///
+/// - If using a Vapoursynth script that contains an unsupported video format.
+///
+/// # Panics
+///
+/// - If the effective lookahead distance is 0.
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(skip_all, fields(frame_limit))
+)]
+#[inline]
+pub fn detect_scene_changes_with_finalized_callback<T: Pixel>(
+    dec: &mut Decoder,
+    opts: DetectionOptions,
+    frame_limit: Option<usize>,
+    progress_callback: Option<&dyn Fn(usize, usize)>,
+    finalized_callback: Option<&dyn Fn(FinalizedDetectionBatch)>,
+) -> anyhow::Result<DetectionResults> {
     let effective_lookahead = opts.effective_lookahead_distance();
     let transient_history = if opts.tuning.transient_similarity.enabled {
         opts.tuning.transient_similarity.frames
@@ -629,15 +692,24 @@ pub fn detect_scene_changes<T: Pixel>(
     } else {
         (None, None)
     };
+    let (finalized_tx, finalized_rx) = if finalized_callback.is_some() {
+        let (tx, rx) = channel();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
 
     let detection_handle = {
         let progress_tx = progress_tx;
+        let finalized_tx = finalized_tx;
         thread::spawn(move || -> anyhow::Result<DetectionResults> {
             let mut detector = detector;
             let mut frame_queue = BTreeMap::new();
             let mut keyframes = BTreeSet::new();
             keyframes.insert(0);
             let mut scores = BTreeMap::new();
+            let mut finalized_until = 0usize;
+            let finalized_lag = finalized_prefix_lag(opts);
 
             let start_time = Instant::now();
             let mut frameno = 0usize;
@@ -707,6 +779,18 @@ pub fn detect_scene_changes<T: Pixel>(
                 if let Some(ref progress_tx) = progress_tx {
                     let _ = progress_tx.send((frameno, keyframes.len()));
                 }
+                if let Some(ref finalized_tx) = finalized_tx {
+                    let end_frame = frameno.saturating_sub(finalized_lag);
+                    send_finalized_detection_batch(
+                        opts.tuning.forward_similarity,
+                        &keyframes,
+                        &scores,
+                        &mut finalized_until,
+                        end_frame,
+                        finalized_tx,
+                        false,
+                    );
+                }
                 if let Some(frame_limit) = frame_limit
                     && frameno == frame_limit
                 {
@@ -719,6 +803,17 @@ pub fn detect_scene_changes<T: Pixel>(
                 &mut keyframes,
                 &mut scores,
             );
+            if let Some(ref finalized_tx) = finalized_tx {
+                send_finalized_detection_batch(
+                    opts.tuning.forward_similarity,
+                    &keyframes,
+                    &scores,
+                    &mut finalized_until,
+                    frameno,
+                    finalized_tx,
+                    true,
+                );
+            }
 
             Ok(DetectionResults {
                 scene_changes: keyframes.into_iter().collect(),
@@ -757,6 +852,11 @@ pub fn detect_scene_changes<T: Pixel>(
                 progress_fn(frames, keyframe_count);
             }
         }
+        if let (Some(finalized_rx), Some(finalized_fn)) = (&finalized_rx, finalized_callback) {
+            while let Ok(batch) = finalized_rx.try_recv() {
+                finalized_fn(batch);
+            }
+        }
     }
 
     drop(frame_tx);
@@ -764,6 +864,11 @@ pub fn detect_scene_changes<T: Pixel>(
     if let (Some(progress_rx), Some(progress_fn)) = (&progress_rx, progress_callback) {
         while let Ok((frames, keyframe_count)) = progress_rx.try_recv() {
             progress_fn(frames, keyframe_count);
+        }
+    }
+    if let (Some(finalized_rx), Some(finalized_fn)) = (&finalized_rx, finalized_callback) {
+        while let Ok(batch) = finalized_rx.try_recv() {
+            finalized_fn(batch);
         }
     }
 
@@ -776,8 +881,175 @@ pub fn detect_scene_changes<T: Pixel>(
             progress_fn(frames, keyframe_count);
         }
     }
+    if let (Some(finalized_rx), Some(finalized_fn)) = (&finalized_rx, finalized_callback) {
+        while let Ok(batch) = finalized_rx.try_recv() {
+            finalized_fn(batch);
+        }
+    }
 
     Ok(results)
+}
+
+fn finalized_prefix_lag(opts: DetectionOptions) -> usize {
+    opts.effective_lookahead_distance()
+        .saturating_add(if opts.tuning.forward_similarity.enabled {
+            opts.tuning.forward_similarity.window_frames.max(1)
+        } else {
+            0
+        })
+        .saturating_add(1)
+}
+
+fn forward_similarity_postprocess_enabled(options: ForwardSimilarityOptions) -> bool {
+    options.enabled && options.require_return_candidate && options.frames != 0
+}
+
+fn send_finalized_detection_batch(
+    forward_similarity: ForwardSimilarityOptions,
+    keyframes: &BTreeSet<usize>,
+    scores: &BTreeMap<usize, ScenecutResult>,
+    finalized_until: &mut usize,
+    end_frame: usize,
+    finalized_tx: &std::sync::mpsc::Sender<FinalizedDetectionBatch>,
+    force: bool,
+) {
+    if end_frame <= *finalized_until {
+        return;
+    }
+    if !force && end_frame - *finalized_until < FINALIZED_BATCH_MIN_FRAMES {
+        return;
+    }
+
+    let start_frame = *finalized_until;
+    let postprocessed = if forward_similarity_postprocess_enabled(forward_similarity) {
+        let mut keyframes = keyframes.clone();
+        let mut scores = scores.clone();
+        apply_forward_similarity_postprocess(forward_similarity, &mut keyframes, &mut scores);
+        Some((keyframes, scores))
+    } else {
+        None
+    };
+    let (keyframes, scores) = match &postprocessed {
+        Some((keyframes, scores)) => (keyframes, scores),
+        None => (keyframes, scores),
+    };
+
+    let frames = (start_frame..end_frame)
+        .filter_map(|frame| {
+            let score = scores.get(&frame).copied();
+            let is_scene_change = keyframes.contains(&frame);
+            (score.is_some() || is_scene_change).then_some(FinalizedDetectionFrame {
+                frame,
+                score,
+                is_scene_change,
+            })
+        })
+        .collect();
+    *finalized_until = end_frame;
+
+    let _ = finalized_tx.send(FinalizedDetectionBatch {
+        start_frame,
+        end_frame,
+        frames,
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn score(value: f64) -> ScenecutResult {
+        let mut score = ScenecutResult::new(value, value, 1.0, 1.0, 64.0);
+        score.forward_adjusted_cost = value;
+        score.refresh_ratios();
+        score
+    }
+
+    #[test]
+    fn finalized_batch_sends_contiguous_prefix_metadata() {
+        let (tx, rx) = channel();
+        let mut keyframes = BTreeSet::new();
+        keyframes.insert(0);
+        keyframes.insert(3);
+        let mut scores = BTreeMap::new();
+        scores.insert(2, score(0.2));
+        scores.insert(3, score(1.4));
+        let mut finalized_until = 0;
+
+        send_finalized_detection_batch(
+            ForwardSimilarityOptions::default(),
+            &keyframes,
+            &scores,
+            &mut finalized_until,
+            4,
+            &tx,
+            true,
+        );
+
+        let batch = rx.recv().expect("batch should be sent");
+        assert_eq!(finalized_until, 4);
+        assert_eq!(batch.start_frame, 0);
+        assert_eq!(batch.end_frame, 4);
+        assert_eq!(batch.frames.len(), 3);
+        assert_eq!(batch.frames[0].frame, 0);
+        assert!(batch.frames[0].is_scene_change);
+        assert!(batch.frames[0].score.is_none());
+        assert_eq!(batch.frames[1].frame, 2);
+        assert!(batch.frames[1].score.is_some());
+        assert!(!batch.frames[1].is_scene_change);
+        assert_eq!(batch.frames[2].frame, 3);
+        assert!(batch.frames[2].score.is_some());
+        assert!(batch.frames[2].is_scene_change);
+    }
+
+    #[test]
+    fn finalized_batch_waits_for_minimum_size_without_force() {
+        let (tx, rx) = channel();
+        let mut keyframes = BTreeSet::new();
+        keyframes.insert(0);
+        let scores = BTreeMap::new();
+        let mut finalized_until = 0;
+
+        send_finalized_detection_batch(
+            ForwardSimilarityOptions::default(),
+            &keyframes,
+            &scores,
+            &mut finalized_until,
+            FINALIZED_BATCH_MIN_FRAMES - 1,
+            &tx,
+            false,
+        );
+
+        assert_eq!(finalized_until, 0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn finalized_batch_sends_at_minimum_size_without_force() {
+        let (tx, rx) = channel();
+        let mut keyframes = BTreeSet::new();
+        keyframes.insert(0);
+        let scores = BTreeMap::new();
+        let mut finalized_until = 0;
+
+        send_finalized_detection_batch(
+            ForwardSimilarityOptions::default(),
+            &keyframes,
+            &scores,
+            &mut finalized_until,
+            FINALIZED_BATCH_MIN_FRAMES,
+            &tx,
+            false,
+        );
+
+        let batch = rx.recv().expect("batch should be sent");
+        assert_eq!(finalized_until, FINALIZED_BATCH_MIN_FRAMES);
+        assert_eq!(batch.start_frame, 0);
+        assert_eq!(batch.end_frame, FINALIZED_BATCH_MIN_FRAMES);
+        assert_eq!(batch.frames.len(), 1);
+        assert_eq!(batch.frames[0].frame, 0);
+        assert!(batch.frames[0].is_scene_change);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -792,7 +1064,7 @@ fn apply_forward_similarity_postprocess(
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
 ) {
-    if !options.enabled || !options.require_return_candidate || options.frames == 0 {
+    if !forward_similarity_postprocess_enabled(options) {
         return;
     }
 
