@@ -46,8 +46,41 @@ impl<T: Pixel> SceneChangeDetector<T> {
             clone
         };
 
-        rayon::scope(|s| {
-            s.spawn(|_| {
+        if self.use_cost_parallelism {
+            rayon::scope(|s| {
+                s.spawn(|_| {
+                    let temp_plane = self
+                        .temp_plane
+                        .get_or_insert_with(|| frame2.y_plane.clone());
+
+                    let intra_costs = estimate_intra_costs(temp_plane, frame2, self.bit_depth);
+                    if let Some(ref mut intra_cache) = self.intra_costs {
+                        intra_cache.insert(input_frameno, intra_costs.clone());
+                    }
+
+                    intra_cost = intra_costs.iter().map(|&cost| cost as u64).sum::<u64>() as f64
+                        / intra_costs.len() as f64;
+                });
+                s.spawn(|_| {
+                    mv_inter_cost = Some(estimate_inter_costs_detailed(
+                        frame2,
+                        frame1,
+                        self.bit_depth,
+                        self.frame_rate,
+                        self.chroma_sampling,
+                        buffer,
+                    ));
+                });
+                s.spawn(|_| {
+                    imp_block_diff = Some(estimate_importance_block_difference_detailed(
+                        frame2,
+                        frame1,
+                        self.bit_depth,
+                    ));
+                });
+            });
+        } else {
+            {
                 let temp_plane = self
                     .temp_plane
                     .get_or_insert_with(|| frame2.y_plane.clone());
@@ -59,25 +92,21 @@ impl<T: Pixel> SceneChangeDetector<T> {
 
                 intra_cost = intra_costs.iter().map(|&cost| cost as u64).sum::<u64>() as f64
                     / intra_costs.len() as f64;
-            });
-            s.spawn(|_| {
-                mv_inter_cost = Some(estimate_inter_costs_detailed(
-                    frame2,
-                    frame1,
-                    self.bit_depth,
-                    self.frame_rate,
-                    self.chroma_sampling,
-                    buffer,
-                ));
-            });
-            s.spawn(|_| {
-                imp_block_diff = Some(estimate_importance_block_difference_detailed(
-                    frame2,
-                    frame1,
-                    self.bit_depth,
-                ));
-            });
-        });
+            }
+            mv_inter_cost = Some(estimate_inter_costs_detailed(
+                frame2,
+                frame1,
+                self.bit_depth,
+                self.frame_rate,
+                self.chroma_sampling,
+                buffer,
+            ));
+            imp_block_diff = Some(estimate_importance_block_difference_detailed(
+                frame2,
+                frame1,
+                self.bit_depth,
+            ));
+        }
 
         // `BIAS` determines how likely we are
         // to choose a keyframe, between 0.0-1.0.
@@ -104,6 +133,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
             importance_blocks: imp_block_diff.blocks,
             importance_cols: imp_block_diff.cols,
             importance_rows: imp_block_diff.rows,
+            top_block_masks: Default::default(),
         }
     }
 }

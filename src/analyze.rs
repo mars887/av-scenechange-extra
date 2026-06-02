@@ -7,6 +7,7 @@ use std::{
 
 use log::debug;
 use num_rational::Rational32;
+use smallvec::SmallVec;
 use v_frame::{chroma::ChromaSubsampling, frame::Frame, pixel::Pixel, plane::Plane};
 
 use self::fast::{FAST_THRESHOLD, detect_scale_factor};
@@ -32,6 +33,8 @@ mod intra;
 mod standard;
 
 const FORWARD_SIMILARITY_DIAGNOSTIC_SLOTS: usize = 8;
+const TOP_BLOCK_MASK_CACHE_INLINE_CAPACITY: usize = 3;
+const FORWARD_REFERENCE_INLINE_CAPACITY: usize = 8;
 
 #[cfg(feature = "bench-internals")]
 pub use self::{
@@ -97,7 +100,7 @@ pub enum ForwardSimilarityCandidateDecision {
     DeltaAboveThreshold,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[allow(missing_docs)]
 pub struct ForwardSimilarityCandidate {
@@ -111,11 +114,21 @@ pub struct ForwardSimilarityCandidate {
 }
 
 #[derive(Clone, Debug)]
+struct TopBlockMaskCache {
+    percent_bits: u64,
+    region_cols: usize,
+    region_rows: usize,
+    spatially_capped: bool,
+    selected: Vec<bool>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct ScenecutAnalysis {
     pub result: ScenecutResult,
     pub importance_blocks: Vec<f64>,
     pub importance_cols: usize,
     pub importance_rows: usize,
+    top_block_masks: SmallVec<[TopBlockMaskCache; TOP_BLOCK_MASK_CACHE_INLINE_CAPACITY]>,
 }
 
 impl ScenecutAnalysis {
@@ -126,7 +139,70 @@ impl ScenecutAnalysis {
             importance_blocks: Vec::new(),
             importance_cols: 0,
             importance_rows: 0,
+            top_block_masks: SmallVec::new(),
         }
+    }
+
+    fn cache_top_block_mask(
+        &mut self,
+        percent: f64,
+        region_cols: usize,
+        region_rows: usize,
+        spatially_capped: bool,
+    ) {
+        if self.importance_blocks.is_empty() || percent <= 0.0 {
+            return;
+        }
+        let percent_bits = percent.to_bits();
+        if self.top_block_masks.iter().any(|entry| {
+            entry.percent_bits == percent_bits
+                && entry.region_cols == region_cols
+                && entry.region_rows == region_rows
+                && entry.spatially_capped == spatially_capped
+        }) {
+            return;
+        }
+
+        let mut selected = vec![false; self.importance_blocks.len()];
+        if spatially_capped {
+            mark_top_blocks_spatially_capped(
+                &self.importance_blocks,
+                percent,
+                self.importance_cols,
+                self.importance_rows,
+                region_cols,
+                region_rows,
+                &mut selected,
+            );
+        } else {
+            mark_top_blocks(&self.importance_blocks, percent, &mut selected);
+        }
+        self.top_block_masks.push(TopBlockMaskCache {
+            percent_bits,
+            region_cols,
+            region_rows,
+            spatially_capped,
+            selected,
+        });
+    }
+
+    fn cached_top_block_mask(
+        &self,
+        percent: f64,
+        region_cols: usize,
+        region_rows: usize,
+        spatially_capped: bool,
+    ) -> Option<&[bool]> {
+        let percent_bits = percent.to_bits();
+        self.top_block_masks
+            .iter()
+            .find(|entry| {
+                entry.percent_bits == percent_bits
+                    && entry.region_cols == region_cols
+                    && entry.region_rows == region_rows
+                    && entry.spatially_capped == spatially_capped
+            })
+            .map(|entry| entry.selected.as_slice())
     }
 }
 
@@ -187,6 +263,9 @@ pub struct SceneChangeDetector<T: Pixel> {
     temp_plane: Option<Plane<T>>,
     /// Buffer for `FrameMEStats` for cost scenecut
     frame_me_stats_buffer: Option<RefMEStats>,
+    /// Whether a single cost comparison may split intra/inter/importance into
+    /// rayon jobs.
+    use_cost_parallelism: bool,
 
     /// Calculated intra costs for each input frame.
     /// These can be cached for reuse by advanced API users.
@@ -262,6 +341,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
             resolution,
             temp_plane: None,
             frame_me_stats_buffer: None,
+            use_cost_parallelism: true,
             intra_costs: None,
         }
     }
@@ -272,6 +352,10 @@ impl<T: Pixel> SceneChangeDetector<T> {
         if self.intra_costs.is_none() {
             self.intra_costs = Some(BTreeMap::new());
         }
+    }
+
+    pub(crate) fn set_cost_parallelism(&mut self, enabled: bool) {
+        self.use_cost_parallelism = enabled;
     }
 
     /// Runs keyframe detection on the next frame in the lookahead queue.
@@ -471,7 +555,34 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 }
             }
         }
+        self.prepare_importance_top_block_masks(&mut analysis);
         self.score_deque.insert(0, analysis);
+    }
+
+    fn prepare_importance_top_block_masks(&self, analysis: &mut ScenecutAnalysis) {
+        match self.tuning.importance_aggregation {
+            ImportanceAggregation::Mean => {}
+            ImportanceAggregation::TemporalTopBlocks {
+                previous_percent,
+                current_percent,
+                next_percent,
+            } => {
+                analysis.cache_top_block_mask(previous_percent, 1, 1, false);
+                analysis.cache_top_block_mask(current_percent, 1, 1, false);
+                analysis.cache_top_block_mask(next_percent, 1, 1, false);
+            }
+            ImportanceAggregation::SpatialTemporalTopBlocks {
+                previous_percent,
+                current_percent,
+                next_percent,
+                region_cols,
+                region_rows,
+            } => {
+                analysis.cache_top_block_mask(previous_percent, region_cols, region_rows, true);
+                analysis.cache_top_block_mask(current_percent, region_cols, region_rows, true);
+                analysis.cache_top_block_mask(next_percent, region_cols, region_rows, true);
+            }
+        }
     }
 
     /// Compares current scene score to adapted threshold based on previous
@@ -767,13 +878,25 @@ impl<T: Pixel> SceneChangeDetector<T> {
 
         let mut selected = vec![false; block_count];
         if let Some(previous) = self.score_deque.get(index + 1) {
-            mark_top_blocks(&previous.importance_blocks, previous_percent, &mut selected);
+            if let Some(mask) = previous.cached_top_block_mask(previous_percent, 1, 1, false) {
+                mark_cached_top_blocks(mask, &mut selected);
+            } else {
+                mark_top_blocks(&previous.importance_blocks, previous_percent, &mut selected);
+            }
         }
-        mark_top_blocks(&current.importance_blocks, current_percent, &mut selected);
+        if let Some(mask) = current.cached_top_block_mask(current_percent, 1, 1, false) {
+            mark_cached_top_blocks(mask, &mut selected);
+        } else {
+            mark_top_blocks(&current.importance_blocks, current_percent, &mut selected);
+        }
         if index > 0
             && let Some(next) = self.score_deque.get(index - 1)
         {
-            mark_top_blocks(&next.importance_blocks, next_percent, &mut selected);
+            if let Some(mask) = next.cached_top_block_mask(next_percent, 1, 1, false) {
+                mark_cached_top_blocks(mask, &mut selected);
+            } else {
+                mark_top_blocks(&next.importance_blocks, next_percent, &mut selected);
+            }
         }
 
         let mut total = 0.0;
@@ -805,9 +928,30 @@ impl<T: Pixel> SceneChangeDetector<T> {
 
         let mut selected = vec![false; block_count];
         if let Some(previous) = self.score_deque.get(index + 1) {
+            if let Some(mask) =
+                previous.cached_top_block_mask(previous_percent, region_cols, region_rows, true)
+            {
+                mark_cached_top_blocks(mask, &mut selected);
+            } else {
+                mark_top_blocks_spatially_capped(
+                    &previous.importance_blocks,
+                    previous_percent,
+                    current.importance_cols,
+                    current.importance_rows,
+                    region_cols,
+                    region_rows,
+                    &mut selected,
+                );
+            }
+        }
+        if let Some(mask) =
+            current.cached_top_block_mask(current_percent, region_cols, region_rows, true)
+        {
+            mark_cached_top_blocks(mask, &mut selected);
+        } else {
             mark_top_blocks_spatially_capped(
-                &previous.importance_blocks,
-                previous_percent,
+                &current.importance_blocks,
+                current_percent,
                 current.importance_cols,
                 current.importance_rows,
                 region_cols,
@@ -815,27 +959,24 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 &mut selected,
             );
         }
-        mark_top_blocks_spatially_capped(
-            &current.importance_blocks,
-            current_percent,
-            current.importance_cols,
-            current.importance_rows,
-            region_cols,
-            region_rows,
-            &mut selected,
-        );
         if index > 0
             && let Some(next) = self.score_deque.get(index - 1)
         {
-            mark_top_blocks_spatially_capped(
-                &next.importance_blocks,
-                next_percent,
-                current.importance_cols,
-                current.importance_rows,
-                region_cols,
-                region_rows,
-                &mut selected,
-            );
+            if let Some(mask) =
+                next.cached_top_block_mask(next_percent, region_cols, region_rows, true)
+            {
+                mark_cached_top_blocks(mask, &mut selected);
+            } else {
+                mark_top_blocks_spatially_capped(
+                    &next.importance_blocks,
+                    next_percent,
+                    current.importance_cols,
+                    current.importance_rows,
+                    region_cols,
+                    region_rows,
+                    &mut selected,
+                );
+            }
         }
 
         let mut total = 0.0;
@@ -907,7 +1048,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
             .copied()
             .rev()
             .take(window_frames)
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[&Arc<Frame<T>>; FORWARD_REFERENCE_INLINE_CAPACITY]>>();
         reference_window.reverse();
         if reference_window.is_empty() {
             reference_window.push(frame_set[0]);
@@ -1709,6 +1850,14 @@ fn mark_top_blocks(source: &[f64], percent: f64, selected: &mut [bool]) {
     }
 }
 
+fn mark_cached_top_blocks(mask: &[bool], selected: &mut [bool]) {
+    for (idx, &is_selected) in mask.iter().enumerate() {
+        if is_selected && let Some(slot) = selected.get_mut(idx) {
+            *slot = true;
+        }
+    }
+}
+
 fn mark_top_blocks_spatially_capped(
     source: &[f64],
     percent: f64,
@@ -1783,7 +1932,7 @@ pub enum ScenecutDecision {
 }
 
 /// Contains the scores for scenecut analysis on a single frame
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize, serde::Deserialize))]
 #[allow(missing_docs)]
 pub struct ScenecutResult {

@@ -34,6 +34,7 @@ pub const fn detection_option_override_names() -> &'static [&'static str] {
         "transient-similarity-threshold",
         "transient-similarity-dark-threshold",
         "transient-similarity-mask-percent",
+        "disable-rayon-on-workers",
     ]
 }
 
@@ -97,6 +98,9 @@ pub enum DetectionOptionOverride {
     TransientSimilarityDarkThreshold(f64),
     /// Sets the fraction of volatile blocks masked from transient similarity.
     TransientSimilarityMaskPercent(f64),
+    /// Disables nested cost-analysis rayon jobs when parallel scene detection
+    /// uses at least this many workers. `0` keeps rayon enabled.
+    DisableRayonOnWorkers(usize),
 }
 
 impl DetectionOptionOverride {
@@ -183,6 +187,9 @@ impl DetectionOptionOverride {
             "transient-similarity-mask-percent" => Ok(Self::TransientSimilarityMaskPercent(
                 parse_percent(name, value)?,
             )),
+            "disable-rayon-on-workers" => {
+                Ok(Self::DisableRayonOnWorkers(parse_usize(name, value)?))
+            }
             _ => Err(ParseDetectionOptionOverrideError::UnknownOption(
                 name.to_string(),
             )),
@@ -339,6 +346,9 @@ impl DetectionOptions {
             }
             DetectionOptionOverride::TransientSimilarityMaskPercent(percent) => {
                 self.tuning.transient_similarity.mask_percent = percent;
+            }
+            DetectionOptionOverride::DisableRayonOnWorkers(workers) => {
+                self.disable_rayon_on_workers = workers;
             }
         }
     }
@@ -513,6 +523,10 @@ mod tests {
             Ok(DetectionOptionOverride::FastThresholdScale(
                 FastThresholdScale::SampleRange
             ))
+        );
+        assert_eq!(
+            "disable-rayon-on-workers=3".parse(),
+            Ok(DetectionOptionOverride::DisableRayonOnWorkers(3))
         );
     }
 }

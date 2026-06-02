@@ -8,19 +8,19 @@ use std::{
 };
 
 use av_decoders::{Decoder, Y4mDecoder};
-use av_scenechange::{DetectionOptions, SceneDetectionSpeed, detect_scene_changes};
+use av_scenechange::{DetectionOptions, detect_scene_changes};
 use criterion::{Criterion, criterion_group, criterion_main};
 
 const TEST_FILE: &str = "./test_files/tt_sif.y4m";
 const HBD_TEST_FILE: &str = "./test_files/tt_sif_10bit.y4m";
 
-const DEFAULT_OPTIONS: DetectionOptions = DetectionOptions {
-    analysis_speed: SceneDetectionSpeed::Standard,
-    detect_flashes: true,
-    min_scenecut_distance: Some(24),
-    max_scenecut_distance: Some(250),
-    lookahead_distance: 5,
-};
+fn default_options() -> DetectionOptions {
+    DetectionOptions {
+        min_scenecut_distance: Some(24),
+        max_scenecut_distance: Some(250),
+        ..DetectionOptions::default()
+    }
+}
 
 fn y4m_8bit(c: &mut Criterion) {
     c.bench_function("y4m detect 8-bit", |b| {
@@ -33,7 +33,7 @@ fn y4m_8bit(c: &mut Criterion) {
                 ))
                 .unwrap();
 
-                (decoder, DEFAULT_OPTIONS)
+                (decoder, default_options())
             },
             |(mut decoder, options)| {
                 detect_scene_changes::<u8>(
@@ -60,7 +60,7 @@ fn y4m_10bit(c: &mut Criterion) {
                 ))
                 .unwrap();
 
-                (decoder, DEFAULT_OPTIONS)
+                (decoder, default_options())
             },
             |(mut decoder, options)| {
                 detect_scene_changes::<u16>(
