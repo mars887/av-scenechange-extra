@@ -670,11 +670,20 @@ fn row_range(geometry: PlaneGeometry, x: isize, y: isize) -> Range<usize> {
     base..base + width
 }
 
-/// Returns a plane downscaled from the source plane by a factor of `scale` (not
-/// padded)
+const DOWNSCALE_PADDING: usize = 8;
+
+/// Returns a plane downscaled from the source plane by a factor of `scale`.
 pub(crate) fn downscale<T: Pixel, const SCALE: usize>(
     plane: &Plane<T>,
     bit_depth: NonZeroU8,
+) -> Plane<T> {
+    downscale_with_padding::<T, SCALE>(plane, bit_depth, DOWNSCALE_PADDING)
+}
+
+pub(crate) fn downscale_with_padding<T: Pixel, const SCALE: usize>(
+    plane: &Plane<T>,
+    bit_depth: NonZeroU8,
+    padding: usize,
 ) -> Plane<T> {
     let new_frame = FrameBuilder::new(
         NonZeroUsize::new(plane.width().get() / SCALE)
@@ -684,17 +693,86 @@ pub(crate) fn downscale<T: Pixel, const SCALE: usize>(
         v_frame::chroma::ChromaSubsampling::Monochrome,
         bit_depth,
     )
+    .luma_padding_left(padding)
+    .luma_padding_right(padding)
+    .luma_padding_top(padding)
+    .luma_padding_bottom(padding)
     .build()
     .expect("should be able to build new frame");
     let mut new_plane = new_frame.y_plane;
 
     downscale_in_place::<T, SCALE>(plane, &mut new_plane);
+    extend_plane_padding(&mut new_plane);
 
     new_plane
 }
 
+pub(crate) fn padded_plane<T: Pixel>(
+    plane: &Plane<T>,
+    bit_depth: NonZeroU8,
+    padding: usize,
+) -> Plane<T> {
+    let new_frame = FrameBuilder::new(
+        plane.width(),
+        plane.height(),
+        v_frame::chroma::ChromaSubsampling::Monochrome,
+        bit_depth,
+    )
+    .luma_padding_left(padding)
+    .luma_padding_right(padding)
+    .luma_padding_top(padding)
+    .luma_padding_bottom(padding)
+    .build()
+    .expect("should be able to build padded frame");
+    let mut new_plane = new_frame.y_plane;
+
+    for y in 0..plane.height().get() {
+        let src = plane.row(y).expect("source row must exist");
+        let dst = new_plane.row_mut(y).expect("destination row must exist");
+        dst.copy_from_slice(src);
+    }
+    extend_plane_padding(&mut new_plane);
+
+    new_plane
+}
+
+fn extend_plane_padding<T: Pixel>(plane: &mut Plane<T>) {
+    let geometry = plane.geometry();
+    let stride = geometry.stride.get();
+    let width = plane.width().get();
+    let height = plane.height().get();
+    let pad_left = geometry.pad_left;
+    let pad_top = geometry.pad_top;
+
+    let data = plane.data_mut();
+    for y in 0..height {
+        let row_start = (pad_top + y) * stride;
+        let visible_start = row_start + pad_left;
+        let visible_end = visible_start + width;
+        let row_end = row_start + stride;
+        let left = data[visible_start];
+        let right = data[visible_end - 1];
+        data[row_start..visible_start].fill(left);
+        data[visible_end..row_end].fill(right);
+    }
+
+    let first_visible_row_start = pad_top * stride;
+    let last_visible_row_start = (pad_top + height - 1) * stride;
+    let first_visible_row =
+        data[first_visible_row_start..first_visible_row_start + stride].to_vec();
+    let last_visible_row = data[last_visible_row_start..last_visible_row_start + stride].to_vec();
+    for y in 0..pad_top {
+        let row_start = y * stride;
+        data[row_start..row_start + stride].copy_from_slice(&first_visible_row);
+    }
+    for y in pad_top + height..geometry.alloc_height().get() {
+        let row_start = y * stride;
+        data[row_start..row_start + stride].copy_from_slice(&last_visible_row);
+    }
+}
+
 /// Downscales the source plane by a factor of `scale`, writing the result to
-/// `in_plane` (not padded)
+/// the visible area of `in_plane`.
 ///
 /// # Panics
 ///

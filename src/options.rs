@@ -34,6 +34,7 @@ pub const fn detection_option_override_names() -> &'static [&'static str] {
         "transient-similarity-threshold",
         "transient-similarity-dark-threshold",
         "transient-similarity-mask-percent",
+        "motion-cost-diagnostics",
         "disable-rayon-on-workers",
     ]
 }
@@ -98,6 +99,8 @@ pub enum DetectionOptionOverride {
     TransientSimilarityDarkThreshold(f64),
     /// Sets the fraction of volatile blocks masked from transient similarity.
     TransientSimilarityMaskPercent(f64),
+    /// Enables expensive motion-compensated cost diagnostics.
+    MotionCostDiagnostics(bool),
     /// Disables nested cost-analysis rayon jobs when parallel scene detection
     /// uses at least this many workers. `0` keeps rayon enabled.
     DisableRayonOnWorkers(usize),
@@ -187,6 +190,7 @@ impl DetectionOptionOverride {
             "transient-similarity-mask-percent" => Ok(Self::TransientSimilarityMaskPercent(
                 parse_percent(name, value)?,
             )),
+            "motion-cost-diagnostics" => Ok(Self::MotionCostDiagnostics(parse_bool(name, value)?)),
             "disable-rayon-on-workers" => {
                 Ok(Self::DisableRayonOnWorkers(parse_usize(name, value)?))
             }
@@ -346,6 +350,9 @@ impl DetectionOptions {
             }
             DetectionOptionOverride::TransientSimilarityMaskPercent(percent) => {
                 self.tuning.transient_similarity.mask_percent = percent;
+            }
+            DetectionOptionOverride::MotionCostDiagnostics(enabled) => {
+                self.tuning.motion_cost_diagnostics = enabled;
             }
             DetectionOptionOverride::DisableRayonOnWorkers(workers) => {
                 self.disable_rayon_on_workers = workers;
@@ -527,6 +534,14 @@ mod tests {
         assert_eq!(
             "disable-rayon-on-workers=3".parse(),
             Ok(DetectionOptionOverride::DisableRayonOnWorkers(3))
+        );
+        assert_eq!(
+            "--motion-cost-diagnostics".parse(),
+            Ok(DetectionOptionOverride::MotionCostDiagnostics(true))
+        );
+        assert_eq!(
+            "no-motion-cost-diagnostics".parse(),
+            Ok(DetectionOptionOverride::MotionCostDiagnostics(false))
         );
     }
 }

@@ -26,6 +26,7 @@ use crate::{
         block::{BlockOffset, BlockSize, MIB_SIZE_LOG2},
         frame::{ALLOWED_REF_FRAMES, FrameInvariants, FrameState, RefType},
         motion::{
+            FrameMEStats,
             MEStats,
             MV_LOW,
             MV_UPP,
@@ -34,9 +35,20 @@ use crate::{
             MotionVector,
             ReadGuardMEStats,
             RefMEStats,
+            ReferenceFrame,
             TileMEStats,
         },
-        plane::{Area, AsRegion, PlaneBlockOffset, PlaneOffset, PlaneRegion, PlaneRegionMut, Rect},
+        plane::{
+            Area,
+            AsRegion,
+            PlaneBlockOffset,
+            PlaneOffset,
+            PlaneRegion,
+            PlaneRegionMut,
+            Rect,
+            downscale_with_padding,
+            padded_plane,
+        },
         prediction::PredictionMode,
         sad::get_sad,
         satd::get_satd,
@@ -50,12 +62,18 @@ use crate::{
         },
         tile::{TileBlockOffset, TileRect, TileStateMut, TilingInfo},
     },
-    math::{ILog, clamp},
+    math::{Fixed, ILog, clamp},
 };
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InterCostEstimate {
+    /// Zero-motion, appearance-change cost. This is the primary scene-cut cost.
     pub mean: f64,
+    /// Motion-compensated inter cost using the reconstructed reference buffer.
+    pub motion_mean: f64,
+    pub motion_cost_computed: bool,
+    pub static_bad_block_ratio: f64,
+    pub static_good_block_ratio: f64,
     pub me_bad_block_ratio: f64,
     pub me_good_block_ratio: f64,
 }
@@ -188,6 +206,24 @@ pub fn estimate_inter_costs<T: Pixel>(
     .mean
 }
 
+pub fn estimate_static_inter_costs_detailed<T: Pixel>(
+    frame: &Arc<Frame<T>>,
+    ref_frame: &Arc<Frame<T>>,
+    bit_depth: usize,
+) -> InterCostEstimate {
+    let (mean, static_bad_block_ratio, static_good_block_ratio) =
+        estimate_static_inter_costs_from_planes(&frame.y_plane, &ref_frame.y_plane, bit_depth);
+    InterCostEstimate {
+        mean,
+        motion_mean: mean,
+        motion_cost_computed: false,
+        static_bad_block_ratio,
+        static_good_block_ratio,
+        me_bad_block_ratio: static_bad_block_ratio,
+        me_good_block_ratio: static_good_block_ratio,
+    }
+}
+
 pub fn estimate_inter_costs_detailed<T: Pixel>(
     frame: &Arc<Frame<T>>,
     ref_frame: &Arc<Frame<T>>,
@@ -196,13 +232,59 @@ pub fn estimate_inter_costs_detailed<T: Pixel>(
     chroma_sampling: ChromaSubsampling,
     buffer: RefMEStats,
 ) -> InterCostEstimate {
+    let bit_depth = NonZeroU8::new(bit_depth as u8).expect("bit depth must be non-zero");
+    const REFERENCE_PADDING: usize = 160;
+    let reference_frame = Arc::new(Frame {
+        y_plane: padded_plane(&ref_frame.y_plane, bit_depth, REFERENCE_PADDING),
+        u_plane: None,
+        v_plane: None,
+        subsampling: ChromaSubsampling::Monochrome,
+        bit_depth,
+    });
+
     let last_fi =
         FrameInvariants::new_key_frame(frame.y_plane.width().get(), frame.y_plane.height().get());
     #[expect(clippy::unwrap_used)]
-    let fi = FrameInvariants::new_inter_frame(&last_fi, 1).unwrap();
+    let mut fi = FrameInvariants::new_inter_frame(&last_fi, 1).unwrap();
+    let reference_slot = fi.ref_frames[RefType::LAST_FRAME.to_index()] as usize;
+    fi.rec_buffer.frames[reference_slot] = Some(Arc::new(ReferenceFrame {
+        frame: Arc::clone(&reference_frame),
+        input_hres: Arc::new(downscale_with_padding::<T, 2>(
+            &reference_frame.y_plane,
+            bit_depth,
+            REFERENCE_PADDING,
+        )),
+        input_qres: Arc::new(downscale_with_padding::<T, 4>(
+            &reference_frame.y_plane,
+            bit_depth,
+            REFERENCE_PADDING,
+        )),
+        frame_me_stats: FrameMEStats::new_arc_array(
+            2 * ref_frame
+                .y_plane
+                .width()
+                .get()
+                .align_power_of_two_and_shift(3),
+            2 * ref_frame
+                .y_plane
+                .height()
+                .get()
+                .align_power_of_two_and_shift(3),
+        ),
+    }));
 
     // Compute the motion vectors.
     let mut fs = FrameState::new_with_frame_and_me_stats_and_rec(Arc::clone(frame), buffer);
+    fs.input_hres = Some(Arc::new(downscale_with_padding::<T, 2>(
+        &frame.y_plane,
+        bit_depth,
+        REFERENCE_PADDING,
+    )));
+    fs.input_qres = Some(Arc::new(downscale_with_padding::<T, 4>(
+        &frame.y_plane,
+        bit_depth,
+        REFERENCE_PADDING,
+    )));
     let mut tiling = TilingInfo::from_target_tiles(
         frame.y_plane.width().get(),
         frame.y_plane.height().get(),
@@ -211,18 +293,20 @@ pub fn estimate_inter_costs_detailed<T: Pixel>(
         TilingInfo::tile_log2(1, 0).expect("invalid tile_log2 count"),
         chroma_sampling == ChromaSubsampling::Yuv422,
     );
-    compute_motion_vectors(&fi, &mut fs, &mut tiling, bit_depth);
+    compute_motion_vectors(&fi, &mut fs, &mut tiling, bit_depth.get() as usize);
 
     // Estimate inter costs
     let plane_org = &frame.y_plane;
-    let plane_ref = &ref_frame.y_plane;
+    let plane_ref = &reference_frame.y_plane;
+    let (mean, static_bad_block_ratio, static_good_block_ratio) =
+        estimate_static_inter_costs_from_planes(plane_org, plane_ref, bit_depth.get() as usize);
     let h_in_imp_b = plane_org.height().get() / IMPORTANCE_BLOCK_SIZE;
     let w_in_imp_b = plane_org.width().get() / IMPORTANCE_BLOCK_SIZE;
     let stats = &fs.frame_me_stats.read().expect("poisoned lock")[0];
     let bsize = BlockSize::from_width_and_height(IMPORTANCE_BLOCK_SIZE, IMPORTANCE_BLOCK_SIZE);
 
-    let mut inter_costs = 0;
-    let mut block_costs = Vec::with_capacity(w_in_imp_b * h_in_imp_b);
+    let mut motion_inter_costs = 0;
+    let mut motion_block_costs = Vec::with_capacity(w_in_imp_b * h_in_imp_b);
     (0..h_in_imp_b).for_each(|y| {
         (0..w_in_imp_b).for_each(|x| {
             let mv = stats[y * 2][x * 2].mv;
@@ -239,13 +323,65 @@ pub fn estimate_inter_costs_detailed<T: Pixel>(
                 height: IMPORTANCE_BLOCK_SIZE,
             }));
 
-            let region_ref = plane_ref.region(Area::Rect(Rect {
+            let motion_region_ref = plane_ref.region(Area::Rect(Rect {
                 x: reference_x as isize / IMP_BLOCK_MV_UNITS_PER_PIXEL as isize,
                 y: reference_y as isize / IMP_BLOCK_MV_UNITS_PER_PIXEL as isize,
                 width: IMPORTANCE_BLOCK_SIZE,
                 height: IMPORTANCE_BLOCK_SIZE,
             }));
 
+            let motion_block_cost = get_satd(
+                &region_org,
+                &motion_region_ref,
+                bsize.width(),
+                bsize.height(),
+                bit_depth.get() as usize,
+            ) as u64;
+            motion_inter_costs += motion_block_cost;
+            motion_block_costs.push(motion_block_cost as f64);
+        });
+    });
+
+    let block_count = w_in_imp_b * h_in_imp_b;
+    let motion_mean = motion_inter_costs as f64 / block_count as f64;
+    let (me_bad_block_ratio, me_good_block_ratio) =
+        block_cost_ratios(&motion_block_costs, motion_mean, block_count);
+
+    InterCostEstimate {
+        mean,
+        motion_mean,
+        motion_cost_computed: true,
+        static_bad_block_ratio,
+        static_good_block_ratio,
+        me_bad_block_ratio,
+        me_good_block_ratio,
+    }
+}
+
+fn estimate_static_inter_costs_from_planes<T: Pixel>(
+    plane_org: &Plane<T>,
+    plane_ref: &Plane<T>,
+    bit_depth: usize,
+) -> (f64, f64, f64) {
+    let h_in_imp_b = plane_org.height().get() / IMPORTANCE_BLOCK_SIZE;
+    let w_in_imp_b = plane_org.width().get() / IMPORTANCE_BLOCK_SIZE;
+    let bsize = BlockSize::from_width_and_height(IMPORTANCE_BLOCK_SIZE, IMPORTANCE_BLOCK_SIZE);
+    let mut inter_costs = 0;
+    let mut block_costs = Vec::with_capacity(w_in_imp_b * h_in_imp_b);
+    (0..h_in_imp_b).for_each(|y| {
+        (0..w_in_imp_b).for_each(|x| {
+            let region_org = plane_org.region(Area::Rect(Rect {
+                x: (x * IMPORTANCE_BLOCK_SIZE) as isize,
+                y: (y * IMPORTANCE_BLOCK_SIZE) as isize,
+                width: IMPORTANCE_BLOCK_SIZE,
+                height: IMPORTANCE_BLOCK_SIZE,
+            }));
+            let region_ref = plane_ref.region(Area::Rect(Rect {
+                x: (x * IMPORTANCE_BLOCK_SIZE) as isize,
+                y: (y * IMPORTANCE_BLOCK_SIZE) as isize,
+                width: IMPORTANCE_BLOCK_SIZE,
+                height: IMPORTANCE_BLOCK_SIZE,
+            }));
             let block_cost = get_satd(
                 &region_org,
                 &region_ref,
@@ -260,24 +396,24 @@ pub fn estimate_inter_costs_detailed<T: Pixel>(
 
     let block_count = w_in_imp_b * h_in_imp_b;
     let mean = inter_costs as f64 / block_count as f64;
+    let (bad_block_ratio, good_block_ratio) = block_cost_ratios(&block_costs, mean, block_count);
+    (mean, bad_block_ratio, good_block_ratio)
+}
+
+fn block_cost_ratios(block_costs: &[f64], mean: f64, block_count: usize) -> (f64, f64) {
     let bad_threshold = mean * 0.75;
     let good_threshold = mean * 0.25;
-    let me_bad_block_ratio = block_costs
+    let bad_block_ratio = block_costs
         .iter()
         .filter(|&&cost| cost >= bad_threshold)
         .count() as f64
         / block_count as f64;
-    let me_good_block_ratio = block_costs
+    let good_block_ratio = block_costs
         .iter()
         .filter(|&&cost| cost <= good_threshold)
         .count() as f64
         / block_count as f64;
-
-    InterCostEstimate {
-        mean,
-        me_bad_block_ratio,
-        me_good_block_ratio,
-    }
+    (bad_block_ratio, good_block_ratio)
 }
 
 #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -1690,4 +1826,96 @@ fn fullpel_diamond_search<T: Pixel>(
     }
 
     assert!(!current.is_empty());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use num_rational::Rational32;
+    use v_frame::{chroma::ChromaSubsampling, frame::FrameBuilder};
+
+    use super::*;
+
+    fn shifted_block_frame(block_x: usize) -> Arc<Frame<u8>> {
+        let mut frame = FrameBuilder::new(
+            NonZeroUsize::new(128).expect("non-zero width"),
+            NonZeroUsize::new(128).expect("non-zero height"),
+            ChromaSubsampling::Monochrome,
+            NonZeroU8::new(8).expect("non-zero bit depth"),
+        )
+        .build()
+        .expect("test frame should build");
+
+        for row in frame.y_plane.rows_mut() {
+            row.fill(16);
+        }
+        for y in 40..88 {
+            let row = frame.y_plane.row_mut(y).expect("row must exist");
+            row[block_x..block_x + 48].fill(220);
+        }
+
+        Arc::new(frame)
+    }
+
+    #[test]
+    fn inter_cost_uses_reference_frame_motion_estimation() {
+        let reference = shifted_block_frame(28);
+        let current = shifted_block_frame(36);
+        let cols = 2 * current
+            .y_plane
+            .width()
+            .get()
+            .align_power_of_two_and_shift(3);
+        let rows = 2 * current
+            .y_plane
+            .height()
+            .get()
+            .align_power_of_two_and_shift(3);
+        let estimate = estimate_inter_costs_detailed(
+            &current,
+            &reference,
+            8,
+            Rational32::new(24, 1),
+            ChromaSubsampling::Monochrome,
+            FrameMEStats::new_arc_array(cols, rows),
+        );
+
+        let bsize = BlockSize::from_width_and_height(IMPORTANCE_BLOCK_SIZE, IMPORTANCE_BLOCK_SIZE);
+        let mut zero_motion_cost = 0u64;
+        for y in 0..current.y_plane.height().get() / IMPORTANCE_BLOCK_SIZE {
+            for x in 0..current.y_plane.width().get() / IMPORTANCE_BLOCK_SIZE {
+                let region_org = current.y_plane.region(Area::Rect(Rect {
+                    x: (x * IMPORTANCE_BLOCK_SIZE) as isize,
+                    y: (y * IMPORTANCE_BLOCK_SIZE) as isize,
+                    width: IMPORTANCE_BLOCK_SIZE,
+                    height: IMPORTANCE_BLOCK_SIZE,
+                }));
+                let region_ref = reference.y_plane.region(Area::Rect(Rect {
+                    x: (x * IMPORTANCE_BLOCK_SIZE) as isize,
+                    y: (y * IMPORTANCE_BLOCK_SIZE) as isize,
+                    width: IMPORTANCE_BLOCK_SIZE,
+                    height: IMPORTANCE_BLOCK_SIZE,
+                }));
+                zero_motion_cost +=
+                    get_satd(&region_org, &region_ref, bsize.width(), bsize.height(), 8) as u64;
+            }
+        }
+        let block_count = (current.y_plane.width().get() / IMPORTANCE_BLOCK_SIZE)
+            * (current.y_plane.height().get() / IMPORTANCE_BLOCK_SIZE);
+        let zero_motion_mean = zero_motion_cost as f64 / block_count as f64;
+
+        assert!(
+            estimate.motion_mean < zero_motion_mean * 0.75,
+            "motion-estimated mean {} should be substantially below zero-motion mean {}",
+            estimate.motion_mean,
+            zero_motion_mean
+        );
+        assert!(
+            (estimate.mean - zero_motion_mean).abs() < f64::EPSILON,
+            "primary scene-cut mean {} should preserve zero-motion appearance cost {}",
+            estimate.mean,
+            zero_motion_mean
+        );
+    }
 }

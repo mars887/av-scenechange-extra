@@ -33,6 +33,10 @@ mod intra;
 mod standard;
 
 const FORWARD_SIMILARITY_DIAGNOSTIC_SLOTS: usize = 8;
+pub(crate) const FRAME_LUMA_SIGNATURE_CELLS: usize = 32;
+const FRAME_LUMA_SIGNATURE_COLS: usize = 8;
+const FRAME_LUMA_SIGNATURE_ROWS: usize = 4;
+const FRAME_LUMA_SIGNATURE_SAMPLES_PER_CELL: usize = 4;
 const TOP_BLOCK_MASK_CACHE_INLINE_CAPACITY: usize = 3;
 const FORWARD_REFERENCE_INLINE_CAPACITY: usize = 8;
 
@@ -523,24 +527,22 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 // It should always be 0 because the first frame of the video is always a
                 // keyframe.
                 analysis.result.backward_adjusted_cost = 0.0;
+                analysis.result.motion_backward_adjusted_cost = 0.0;
             } else {
-                let mut adjusted_cost = f64::MAX;
-                for other_cost in self
-                    .score_deque
-                    .iter()
-                    .take(self.deque_offset)
-                    .map(|i| i.result.inter_cost)
-                {
-                    let this_cost = analysis.result.inter_cost - other_cost;
-                    if this_cost < adjusted_cost {
-                        adjusted_cost = this_cost;
-                    }
-                    if adjusted_cost < 0.0 {
-                        adjusted_cost = 0.0;
-                        break;
-                    }
-                }
-                analysis.result.backward_adjusted_cost = adjusted_cost;
+                analysis.result.backward_adjusted_cost = adjusted_peak_cost(
+                    analysis.result.inter_cost,
+                    self.score_deque
+                        .iter()
+                        .take(self.deque_offset)
+                        .map(|i| i.result.inter_cost),
+                );
+                analysis.result.motion_backward_adjusted_cost = adjusted_peak_cost(
+                    analysis.result.motion_inter_cost,
+                    self.score_deque
+                        .iter()
+                        .take(self.deque_offset)
+                        .map(|i| i.result.motion_inter_cost),
+                );
             }
             if !self.score_deque.is_empty() {
                 for i in 0..cmp::min(self.deque_offset, self.score_deque.len()) {
@@ -552,6 +554,19 @@ impl<T: Pixel> SceneChangeDetector<T> {
                     if self.score_deque[i].result.forward_adjusted_cost < 0.0 {
                         self.score_deque[i].result.forward_adjusted_cost = 0.0;
                     }
+                    let motion_adjusted_cost = self.score_deque[i].result.motion_inter_cost
+                        - analysis.result.motion_inter_cost;
+                    if i == 0
+                        || motion_adjusted_cost
+                            < self.score_deque[i].result.motion_forward_adjusted_cost
+                    {
+                        self.score_deque[i].result.motion_forward_adjusted_cost =
+                            motion_adjusted_cost;
+                    }
+                    if self.score_deque[i].result.motion_forward_adjusted_cost < 0.0 {
+                        self.score_deque[i].result.motion_forward_adjusted_cost = 0.0;
+                    }
+                    self.score_deque[i].result.refresh_ratios();
                 }
             }
         }
@@ -746,7 +761,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
             return false;
         }
         if self.tuning.importance_cut_max_me_good_ratio > 0.0
-            && current.me_good_block_ratio > self.tuning.importance_cut_max_me_good_ratio
+            && current.static_good_block_ratio > self.tuning.importance_cut_max_me_good_ratio
         {
             return false;
         }
@@ -774,7 +789,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 (spatial_passed || global_passed)
                     && current.cost_ratio >= self.tuning.importance_cut_relaxed_min_cost_ratio
                     && previous_ratio <= self.tuning.importance_cut_relaxed_max_previous_ratio
-                    && current.me_bad_block_ratio >= self.tuning.importance_cut_min_me_bad_ratio
+                    && current.static_bad_block_ratio >= self.tuning.importance_cut_min_me_bad_ratio
             });
         if !strict_passed && !relaxed_passed {
             return false;
@@ -1613,6 +1628,85 @@ fn masked_delta_lower_bound_8bit(delta_8bit: f64, mask_percent: f64) -> f64 {
     ((delta_8bit - mask_percent * 255.0) / (1.0 - mask_percent)).max(0.0)
 }
 
+pub(crate) fn frame_luma_signature_8bit<T: Pixel>(
+    frame: &Frame<T>,
+    bit_depth: usize,
+) -> [u8; FRAME_LUMA_SIGNATURE_CELLS] {
+    let plane = &frame.y_plane;
+    let width = plane.width().get();
+    let height = plane.height().get();
+    let stride = plane.geometry().stride.get();
+    let origin = plane.data_origin();
+    let data = plane.data();
+    let sample_max = (1u64 << bit_depth).saturating_sub(1).max(1);
+    let mut signature = [0u8; FRAME_LUMA_SIGNATURE_CELLS];
+    let mut cell_idx = 0;
+
+    for cell_y in 0..FRAME_LUMA_SIGNATURE_ROWS {
+        let y0 = cell_y * height / FRAME_LUMA_SIGNATURE_ROWS;
+        let y1 = (cell_y + 1) * height / FRAME_LUMA_SIGNATURE_ROWS;
+        for cell_x in 0..FRAME_LUMA_SIGNATURE_COLS {
+            let x0 = cell_x * width / FRAME_LUMA_SIGNATURE_COLS;
+            let x1 = (cell_x + 1) * width / FRAME_LUMA_SIGNATURE_COLS;
+            let mut sum = 0u64;
+
+            for sample_y in 0..FRAME_LUMA_SIGNATURE_SAMPLES_PER_CELL {
+                let y = sampled_cell_position(
+                    y0,
+                    y1,
+                    height,
+                    sample_y,
+                    FRAME_LUMA_SIGNATURE_SAMPLES_PER_CELL,
+                );
+                for sample_x in 0..FRAME_LUMA_SIGNATURE_SAMPLES_PER_CELL {
+                    let x = sampled_cell_position(
+                        x0,
+                        x1,
+                        width,
+                        sample_x,
+                        FRAME_LUMA_SIGNATURE_SAMPLES_PER_CELL,
+                    );
+                    let pixel = data[origin + y * stride + x]
+                        .to_u32()
+                        .expect("pixel value should fit in u32");
+                    sum += u64::from(pixel);
+                }
+            }
+
+            let samples = (FRAME_LUMA_SIGNATURE_SAMPLES_PER_CELL
+                * FRAME_LUMA_SIGNATURE_SAMPLES_PER_CELL) as u64;
+            let scaled = (sum * 255 + (sample_max * samples) / 2) / (sample_max * samples);
+            signature[cell_idx] = scaled.min(255) as u8;
+            cell_idx += 1;
+        }
+    }
+
+    signature
+}
+
+fn sampled_cell_position(
+    start: usize,
+    end: usize,
+    limit: usize,
+    sample: usize,
+    samples: usize,
+) -> usize {
+    let len = end.saturating_sub(start).max(1);
+    (start + ((2 * sample + 1) * len) / (2 * samples)).min(limit.saturating_sub(1))
+}
+
+fn adjusted_peak_cost(current_cost: f64, previous_costs: impl Iterator<Item = f64>) -> f64 {
+    let mut adjusted_cost: Option<f64> = None;
+    for previous_cost in previous_costs {
+        let cost = current_cost - previous_cost;
+        adjusted_cost = Some(adjusted_cost.map_or(cost, |adjusted_cost| adjusted_cost.min(cost)));
+        if cost < 0.0 {
+            return 0.0;
+        }
+    }
+    adjusted_cost.unwrap_or(0.0)
+}
+
 fn block_region_index(
     block_idx: usize,
     cols: usize,
@@ -1929,6 +2023,19 @@ pub enum ScenecutDecision {
     ForcedMaxDistance,
     SuppressedForwardSimilarity,
     SuppressedTransientSimilarity,
+    SuppressedTextCardCluster,
+    SuppressedFastMotion,
+    SuppressedStaticCredits,
+    SuppressedDarkOcclusion,
+    CutDarkScenePeak,
+    CutSparseScenePeak,
+    CutRefinedSparsePeak,
+    SuppressedRefinedSparsePeak,
+    CutShiftedBoundary,
+    SuppressedShiftedBoundary,
+    CutAbaReturn,
+    SuppressedAbaChain,
+    CutForwardSimilarityRecovery,
 }
 
 /// Contains the scores for scenecut analysis on a single frame
@@ -1937,6 +2044,8 @@ pub enum ScenecutDecision {
 #[allow(missing_docs)]
 pub struct ScenecutResult {
     pub inter_cost: f64,
+    pub motion_inter_cost: f64,
+    pub motion_cost_computed: bool,
     pub imp_block_cost_raw: f64,
     pub imp_block_cost: f64,
     pub global_imp_block_cost: f64,
@@ -1945,11 +2054,21 @@ pub struct ScenecutResult {
     pub global_imp_block_ratio: f64,
     pub backward_adjusted_cost: f64,
     pub forward_adjusted_cost: f64,
+    pub motion_backward_adjusted_cost: f64,
+    pub motion_forward_adjusted_cost: f64,
     pub threshold: f64,
     pub cost_ratio: f64,
+    pub motion_cost_ratio: f64,
     pub avg_luma_8bit: f64,
+    pub static_bad_block_ratio: f64,
+    pub static_good_block_ratio: f64,
     pub me_bad_block_ratio: f64,
     pub me_good_block_ratio: f64,
+    #[cfg_attr(
+        feature = "serialize",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub frame_luma_signature: Option<[u8; FRAME_LUMA_SIGNATURE_CELLS]>,
     pub transient_similarity_score: Option<f64>,
     pub forward_similarity_score: Option<f64>,
     #[cfg_attr(
@@ -1978,6 +2097,8 @@ impl ScenecutResult {
     ) -> Self {
         let mut result = Self {
             inter_cost,
+            motion_inter_cost: inter_cost,
+            motion_cost_computed: false,
             imp_block_cost_raw: imp_block_cost,
             imp_block_cost,
             global_imp_block_cost: imp_block_cost,
@@ -1986,11 +2107,17 @@ impl ScenecutResult {
             global_imp_block_ratio: 0.0,
             backward_adjusted_cost: 0.0,
             forward_adjusted_cost: 0.0,
+            motion_backward_adjusted_cost: 0.0,
+            motion_forward_adjusted_cost: 0.0,
             threshold,
             cost_ratio: 0.0,
+            motion_cost_ratio: 0.0,
             avg_luma_8bit,
+            static_bad_block_ratio: 0.0,
+            static_good_block_ratio: 0.0,
             me_bad_block_ratio: 0.0,
             me_good_block_ratio: 0.0,
+            frame_luma_signature: None,
             transient_similarity_score: None,
             forward_similarity_score: None,
             forward_similarity_candidates: [None; FORWARD_SIMILARITY_DIAGNOSTIC_SLOTS],
@@ -2006,6 +2133,11 @@ impl ScenecutResult {
     pub(crate) fn refresh_ratios(&mut self) {
         self.cost_ratio = if self.threshold > 0.0 {
             self.forward_adjusted_cost / self.threshold
+        } else {
+            0.0
+        };
+        self.motion_cost_ratio = if self.threshold > 0.0 {
+            self.motion_forward_adjusted_cost / self.threshold
         } else {
             0.0
         };

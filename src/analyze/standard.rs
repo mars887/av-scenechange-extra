@@ -5,8 +5,9 @@ use v_frame::{frame::Frame, pixel::Pixel};
 use super::{SceneChangeDetector, ScenecutAnalysis, ScenecutResult};
 use crate::{
     analyze::{
+        frame_luma_signature_8bit,
         importance::estimate_importance_block_difference_detailed,
-        inter::estimate_inter_costs_detailed,
+        inter::{estimate_inter_costs_detailed, estimate_static_inter_costs_detailed},
         intra::estimate_intra_costs,
     },
     data::motion::FrameMEStats,
@@ -34,17 +35,20 @@ impl<T: Pixel> SceneChangeDetector<T> {
         let mut mv_inter_cost = None;
         let mut imp_block_diff = None;
 
-        let cols = 2 * self.resolution.0.align_power_of_two_and_shift(3);
-        let rows = 2 * self.resolution.1.align_power_of_two_and_shift(3);
-
-        let buffer = if let Some(buffer) = &self.frame_me_stats_buffer {
-            Arc::clone(buffer)
-        } else {
-            let frame_me_stats = FrameMEStats::new_arc_array(cols, rows);
-            let clone = Arc::clone(&frame_me_stats);
-            self.frame_me_stats_buffer = Some(frame_me_stats);
-            clone
-        };
+        let compute_motion_cost = self.tuning.motion_cost_diagnostics;
+        let mut motion_buffer = None;
+        if compute_motion_cost {
+            let cols = 2 * self.resolution.0.align_power_of_two_and_shift(3);
+            let rows = 2 * self.resolution.1.align_power_of_two_and_shift(3);
+            motion_buffer = Some(if let Some(buffer) = &self.frame_me_stats_buffer {
+                Arc::clone(buffer)
+            } else {
+                let frame_me_stats = FrameMEStats::new_arc_array(cols, rows);
+                let clone = Arc::clone(&frame_me_stats);
+                self.frame_me_stats_buffer = Some(frame_me_stats);
+                clone
+            });
+        }
 
         if self.use_cost_parallelism {
             rayon::scope(|s| {
@@ -61,16 +65,26 @@ impl<T: Pixel> SceneChangeDetector<T> {
                     intra_cost = intra_costs.iter().map(|&cost| cost as u64).sum::<u64>() as f64
                         / intra_costs.len() as f64;
                 });
-                s.spawn(|_| {
-                    mv_inter_cost = Some(estimate_inter_costs_detailed(
-                        frame2,
-                        frame1,
-                        self.bit_depth,
-                        self.frame_rate,
-                        self.chroma_sampling,
-                        buffer,
-                    ));
-                });
+                if let Some(buffer) = motion_buffer {
+                    s.spawn(|_| {
+                        mv_inter_cost = Some(estimate_inter_costs_detailed(
+                            frame2,
+                            frame1,
+                            self.bit_depth,
+                            self.frame_rate,
+                            self.chroma_sampling,
+                            buffer,
+                        ));
+                    });
+                } else {
+                    s.spawn(|_| {
+                        mv_inter_cost = Some(estimate_static_inter_costs_detailed(
+                            frame2,
+                            frame1,
+                            self.bit_depth,
+                        ));
+                    });
+                }
                 s.spawn(|_| {
                     imp_block_diff = Some(estimate_importance_block_difference_detailed(
                         frame2,
@@ -93,14 +107,18 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 intra_cost = intra_costs.iter().map(|&cost| cost as u64).sum::<u64>() as f64
                     / intra_costs.len() as f64;
             }
-            mv_inter_cost = Some(estimate_inter_costs_detailed(
-                frame2,
-                frame1,
-                self.bit_depth,
-                self.frame_rate,
-                self.chroma_sampling,
-                buffer,
-            ));
+            mv_inter_cost = Some(if let Some(buffer) = motion_buffer {
+                estimate_inter_costs_detailed(
+                    frame2,
+                    frame1,
+                    self.bit_depth,
+                    self.frame_rate,
+                    self.chroma_sampling,
+                    buffer,
+                )
+            } else {
+                estimate_static_inter_costs_detailed(frame2, frame1, self.bit_depth)
+            });
             imp_block_diff = Some(estimate_importance_block_difference_detailed(
                 frame2,
                 frame1,
@@ -125,8 +143,13 @@ impl<T: Pixel> SceneChangeDetector<T> {
             threshold,
             imp_block_diff.avg_luma_8bit,
         );
+        result.motion_inter_cost = mv_inter_cost.motion_mean;
+        result.motion_cost_computed = mv_inter_cost.motion_cost_computed;
+        result.static_bad_block_ratio = mv_inter_cost.static_bad_block_ratio;
+        result.static_good_block_ratio = mv_inter_cost.static_good_block_ratio;
         result.me_bad_block_ratio = mv_inter_cost.me_bad_block_ratio;
         result.me_good_block_ratio = mv_inter_cost.me_good_block_ratio;
+        result.frame_luma_signature = Some(frame_luma_signature_8bit(frame2, self.bit_depth));
 
         ScenecutAnalysis {
             result,
