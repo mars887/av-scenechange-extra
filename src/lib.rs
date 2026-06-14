@@ -885,30 +885,59 @@ pub fn detect_scene_changes_parallel<T: Pixel + Send + Sync + 'static>(
                 let worker_needed_from = Arc::clone(&needed_from[worker]);
                 let worker_frame_request_tx = frame_request_tx.clone();
                 scope.spawn(move || {
-                    let result = run_parallel_worker::<T>(
-                        worker,
-                        start_frame,
-                        frame_count,
-                        &video_details,
-                        opts,
-                        worker_store,
-                        worker_tx.clone(),
-                        worker_stop,
-                        worker_needed_from,
-                        worker_frame_request_tx,
-                        use_worker_cost_parallelism,
-                    );
+                    let panic_store = Arc::clone(&worker_store);
+                    let worker_analysis_tx = worker_tx.clone();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_parallel_worker::<T>(
+                            worker,
+                            start_frame,
+                            frame_count,
+                            &video_details,
+                            opts,
+                            worker_store,
+                            worker_analysis_tx,
+                            worker_stop,
+                            worker_needed_from,
+                            worker_frame_request_tx,
+                            use_worker_cost_parallelism,
+                        )
+                    }));
                     let message = match result {
-                        Ok(frame_count) => ParallelWorkerMessage::Done {
+                        Ok(Ok(frame_count)) => ParallelWorkerMessage::Done {
                             worker,
                             frame_count,
                             error: None,
                         },
-                        Err(error) => ParallelWorkerMessage::Done {
-                            worker,
-                            frame_count: start_frame,
-                            error: Some(error.to_string()),
-                        },
+                        Ok(Err(error)) => {
+                            // Normal worker error: fail the shared store so the
+                            // inline streamed reader's `produced_or_error()?`
+                            // returns promptly instead of decoding the rest of the
+                            // video, and any sibling blocked in `store.get` is
+                            // released (C4 defect 2).
+                            panic_store
+                                .fail(format!("scene detection worker {worker} failed: {error}"));
+                            ParallelWorkerMessage::Done {
+                                worker,
+                                frame_count: start_frame,
+                                error: Some(error.to_string()),
+                            }
+                        }
+                        Err(payload) => {
+                            // Worker panicked: convert the payload into the same
+                            // failure-signalling path (fail the store + report to
+                            // reconcile) so the API returns `Err` rather than
+                            // re-throwing the panic out of `thread::scope` (C4
+                            // defect 1).
+                            let detail = parallel_panic_message(&*payload);
+                            panic_store.fail(format!(
+                                "scene detection worker {worker} panicked: {detail}"
+                            ));
+                            ParallelWorkerMessage::Done {
+                                worker,
+                                frame_count: start_frame,
+                                error: Some(format!("worker {worker} panicked: {detail}")),
+                            }
+                        }
                     };
                     let _ = worker_tx.send(message);
                 })
@@ -964,21 +993,34 @@ pub fn detect_scene_changes_parallel<T: Pixel + Send + Sync + 'static>(
         drop(reader_tx);
         drain_parallel_progress(&progress_rx, progress_callback);
 
-        let mut results = reconcile_handle
+        let reconcile_result = reconcile_handle
             .join()
-            .map_err(|_| anyhow::anyhow!("scene detection reconciliation thread panicked"))??;
+            .map_err(|_| anyhow::anyhow!("scene detection reconciliation thread panicked"))
+            .and_then(|inner| inner);
         drain_parallel_progress(&progress_rx, progress_callback);
 
+        // Stop every worker, then ALWAYS join them before returning. Joining a
+        // scoped thread consumes its panic payload, which is what prevents
+        // `thread::scope` from re-throwing a worker panic as an API-level panic
+        // (C4 defect 1). On failure the worker already called `store.fail`, so the
+        // inline reader has already stopped and these joins return promptly.
         for stop in &stop_after {
             stop.store(0, Ordering::Release);
         }
-
+        let mut worker_panic: Option<anyhow::Error> = None;
         for handle in worker_handles {
-            handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("scene detection worker thread panicked"))?;
+            if handle.join().is_err() && worker_panic.is_none() {
+                worker_panic = Some(anyhow::anyhow!("scene detection worker thread panicked"));
+            }
         }
         drain_parallel_progress(&progress_rx, progress_callback);
+
+        // Prefer the reconcile error (it carries the specific per-worker failure
+        // message forwarded via `Done`); fall back to a worker join panic.
+        let mut results = reconcile_result?;
+        if let Some(worker_panic) = worker_panic {
+            return Err(worker_panic);
+        }
 
         let produced = read_result?;
         results.frame_count = produced.min(results.frame_count);
@@ -1051,29 +1093,45 @@ where
                 let worker_stop = Arc::clone(&stop_after[worker]);
                 let make_decoder = &make_decoder;
                 scope.spawn(move || {
-                    let result = run_parallel_indexed_decoder_worker::<T, F>(
-                        worker,
-                        start_frame,
-                        frame_start,
-                        frame_count,
-                        &video_details,
-                        opts,
-                        worker_tx.clone(),
-                        worker_stop,
-                        make_decoder,
-                        use_worker_cost_parallelism,
-                    );
+                    let worker_analysis_tx = worker_tx.clone();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_parallel_indexed_decoder_worker::<T, F>(
+                            worker,
+                            start_frame,
+                            frame_start,
+                            frame_count,
+                            &video_details,
+                            opts,
+                            worker_analysis_tx,
+                            worker_stop,
+                            make_decoder,
+                            use_worker_cost_parallelism,
+                        )
+                    }));
                     let message = match result {
-                        Ok(frame_count) => ParallelWorkerMessage::Done {
+                        Ok(Ok(frame_count)) => ParallelWorkerMessage::Done {
                             worker,
                             frame_count,
                             error: None,
                         },
-                        Err(error) => ParallelWorkerMessage::Done {
+                        Ok(Err(error)) => ParallelWorkerMessage::Done {
                             worker,
                             frame_count: start_frame,
                             error: Some(error.to_string()),
                         },
+                        Err(payload) => {
+                            // Worker panicked: report it to reconcile as a failure
+                            // so the API returns `Err` instead of re-throwing the
+                            // panic out of `thread::scope`. Siblings are stopped by
+                            // the epilogue's `stop_after = 0` once reconcile
+                            // returns (C4 defect 1).
+                            let detail = parallel_panic_message(&*payload);
+                            ParallelWorkerMessage::Done {
+                                worker,
+                                frame_count: start_frame,
+                                error: Some(format!("worker {worker} panicked: {detail}")),
+                            }
+                        }
                     };
                     let _ = worker_tx.send(message);
                 })
@@ -1099,20 +1157,30 @@ where
             drain_parallel_progress(&progress_rx, progress_callback);
             thread::sleep(PARALLEL_READER_WAIT);
         }
-        let mut results = reconcile_handle
+        let reconcile_result = reconcile_handle
             .join()
-            .map_err(|_| anyhow::anyhow!("scene detection reconciliation thread panicked"))??;
+            .map_err(|_| anyhow::anyhow!("scene detection reconciliation thread panicked"))
+            .and_then(|inner| inner);
         drain_parallel_progress(&progress_rx, progress_callback);
 
+        // Stop every worker, then ALWAYS join them before returning so a scoped
+        // worker panic is consumed here (converted to `Err`) instead of being
+        // re-thrown as an API-level panic when this closure returns (C4 defect 1).
         for stop in &stop_after {
             stop.store(0, Ordering::Release);
         }
+        let mut worker_panic: Option<anyhow::Error> = None;
         for handle in worker_handles {
-            handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("scene detection worker thread panicked"))?;
+            if handle.join().is_err() && worker_panic.is_none() {
+                worker_panic = Some(anyhow::anyhow!("scene detection worker thread panicked"));
+            }
         }
         drain_parallel_progress(&progress_rx, progress_callback);
+
+        let mut results = reconcile_result?;
+        if let Some(worker_panic) = worker_panic {
+            return Err(worker_panic);
+        }
 
         results.speed = results.frame_count as f64 / start_time.elapsed().as_secs_f64();
         if let Some(progress_fn) = progress_callback {
@@ -1196,7 +1264,7 @@ fn read_parallel_streamed_frames<T: Pixel>(
 #[expect(clippy::too_many_arguments)]
 fn read_parallel_indexed_frames<'scope, T: Pixel>(
     dec: &mut Decoder,
-    frame_count: usize,
+    mut frame_count: usize,
     store: &SharedFrameStore<T>,
     needed_from: &[Arc<AtomicUsize>],
     frame_request_rx: Receiver<usize>,
@@ -1205,7 +1273,6 @@ fn read_parallel_indexed_frames<'scope, T: Pixel>(
     progress_rx: &Option<Receiver<(usize, usize)>>,
     progress_callback: Option<&dyn Fn(usize, usize)>,
 ) -> anyhow::Result<usize> {
-    let mut loaded = BTreeSet::new();
     loop {
         drain_parallel_progress(progress_rx, progress_callback);
         prune_parallel_indexed_frame_store(store, needed_from);
@@ -1218,7 +1285,7 @@ fn read_parallel_indexed_frames<'scope, T: Pixel>(
 
         match frame_request_rx.recv_timeout(PARALLEL_READER_WAIT) {
             Ok(frame) => {
-                if frame >= frame_count || !loaded.insert(frame) {
+                if frame >= frame_count || store.contains(frame) {
                     continue;
                 }
                 match dec.get_video_frame(frame) {
@@ -1227,8 +1294,21 @@ fn read_parallel_indexed_frames<'scope, T: Pixel>(
                         prune_parallel_indexed_frame_store(store, needed_from);
                     }
                     Err(av_decoders::DecoderError::EndOfFile) => {
+                        // `frame` is the first non-decodable index, so the true
+                        // decodable length is `frame` (the assumed `frame_count`
+                        // over-estimated it — e.g. y4m with unknown total, or
+                        // metadata that lied). Clamp `frame_count` down so future
+                        // requests for indices >= `frame` are skipped by the guard
+                        // above and we never re-hit EOF, and mark the store
+                        // finished at the true count so `get(f')` returns
+                        // `Ok(None)` for every `f' >= frame`. Do NOT return:
+                        // slower earlier-chunk workers may still be blocked on
+                        // valid frames `f' < frame` that nobody has decoded yet,
+                        // and the reader must stay alive to serve them. The loop
+                        // still terminates via its existing handle/channel
+                        // conditions once all workers finish.
+                        frame_count = frame_count.min(frame);
                         store.finish(frame);
-                        return Ok(frame);
                     }
                     Err(e) => {
                         store.fail(e.to_string());
@@ -1535,6 +1615,19 @@ impl<T: Pixel> SharedFrameStore<T> {
         inner.frames.retain(|frame, _| frames.contains(frame));
     }
 
+    /// Non-blocking check whether the store currently holds `frame`.
+    ///
+    /// Used by the indexed reader to decide whether a requested frame must be
+    /// (re-)decoded. Querying the store directly — rather than a separate
+    /// permanently-growing `loaded` ledger — lets evicted frames be re-decoded
+    /// when an earlier worker reaches a chunk overlap, which is what closes the
+    /// C2 deadlock.
+    #[cfg(feature = "vapoursynth")]
+    fn contains(&self, frame: usize) -> bool {
+        let inner = self.inner.lock().expect("frame store lock poisoned");
+        inner.frames.contains_key(&frame)
+    }
+
     fn produced_or_error(&self) -> anyhow::Result<usize> {
         let inner = self.inner.lock().expect("frame store lock poisoned");
         if let Some(error) = &inner.error {
@@ -1727,7 +1820,7 @@ fn run_parallel_indexed_decoder_worker<T, F>(
     worker: usize,
     start_frame: usize,
     frame_start: usize,
-    frame_limit: usize,
+    mut frame_limit: usize,
     video_details: &av_decoders::VideoDetails,
     opts: DetectionOptions,
     tx: Sender<ParallelWorkerMessage>,
@@ -1762,9 +1855,34 @@ where
 
         while next_input_frameno < max_needed {
             let source_frame = frame_start + next_input_frameno;
-            let frame = source.get_video_frame(source_frame).map_err(|error| {
-                anyhow::anyhow!("worker {worker} failed to read frame {source_frame}: {error}")
-            })?;
+            let frame = match source.get_video_frame(source_frame) {
+                Ok(frame) => frame,
+                Err(av_decoders::DecoderError::EndOfFile) => {
+                    // `next_input_frameno` is the first non-decodable
+                    // (worker-relative) index, so the true decodable length is
+                    // exactly `next_input_frameno` — `frame_limit` over-estimated
+                    // it (e.g. y4m with unknown total, or metadata that lied).
+                    // Unlike `detect_scene_changes_parallel`, this path has no
+                    // reader thread, so reconcile never receives a `ReaderDone`
+                    // otherwise: report the discovered real end ourselves so
+                    // reconcile can clamp `actual_frame_limit` and actually
+                    // complete (a graceful break alone would leave it stuck on the
+                    // over-estimate). Then clamp our own `frame_limit` so the outer
+                    // loop terminates promptly and this fetch never re-requests a
+                    // past-EOF index. Analyze the frames already obtained; this is
+                    // a graceful stop, NOT an error (C5).
+                    let _ = tx.send(ParallelWorkerMessage::ReaderDone {
+                        frame_count: next_input_frameno,
+                    });
+                    frame_limit = frame_limit.min(next_input_frameno);
+                    break;
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "worker {worker} failed to read frame {source_frame}: {error}"
+                    ));
+                }
+            };
             frame_queue.push_next(next_input_frameno, Arc::new(frame));
             next_input_frameno += 1;
         }
@@ -1863,6 +1981,18 @@ impl ParallelWorkerOutput {
     }
 }
 
+/// Extracts a human-readable message from a panic payload captured by
+/// `std::panic::catch_unwind`, handling the common `&str` / `String` cases.
+fn parallel_panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
 fn reconcile_parallel_workers(
     rx: Receiver<ParallelWorkerMessage>,
     opts: DetectionOptions,
@@ -1923,7 +2053,14 @@ fn reconcile_parallel_workers(
                 }
             }
             ParallelWorkerMessage::ReaderDone { frame_count } => {
-                actual_frame_limit = frame_count.min(frame_limit);
+                // MIN-accumulate so multiple reporters converge to the true end.
+                // The single-reader path (`detect_scene_changes_parallel`) sends
+                // exactly one `ReaderDone`, and `actual_frame_limit` starts at
+                // `frame_limit`, so this is equivalent to the previous
+                // `frame_count.min(frame_limit)`. In `_with_decoders` several
+                // workers may each report the (worker-relative) index at which
+                // they hit EOF; the smallest is the real decodable length.
+                actual_frame_limit = actual_frame_limit.min(frame_count);
             }
         }
 

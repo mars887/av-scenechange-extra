@@ -796,12 +796,19 @@ pub(crate) fn downscale_in_place<T: Pixel, const SCALE: usize>(
         let half_box_pixels = box_pixels as u32 / 2; // Used for rounding int division
 
         let data_origin = &src.data()[src.data_origin()..];
+        // The destination plane is allocated WITH padding; its visible area
+        // begins at `data_origin()` (= pad_top*stride + pad_left), not at offset
+        // 0. `stride` already accounts for the left/right padding, so only this
+        // origin offset has to be added. When padding == 0, `dst_origin == 0`
+        // and behavior is unchanged. Must be read before `data_mut()` borrows
+        // `in_plane` mutably for the rest of the loop.
+        let dst_origin = in_plane.data_origin();
         let plane_data_mut_slice = in_plane.data_mut();
 
         let src_stride = src.geometry().stride.get();
         // Iter dst rows
         for row_idx in 0..height {
-            let dst_row = plane_data_mut_slice.get_unchecked_mut(row_idx * stride..);
+            let dst_row = plane_data_mut_slice.get_unchecked_mut(dst_origin + row_idx * stride..);
             // Iter dst cols
             for (col_idx, dst) in dst_row.get_unchecked_mut(..width).iter_mut().enumerate() {
                 macro_rules! generate_inner_loop {
