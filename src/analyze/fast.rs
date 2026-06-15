@@ -18,7 +18,9 @@ impl<T: Pixel> SceneChangeDetector<T> {
         frame1: &Arc<Frame<T>>,
         frame2: &Arc<Frame<T>>,
     ) -> ScenecutResult {
-        if let Some(scale_func) = &self.scale_func {
+        if let Some(scale_func) = &self.scale_func
+            && !self.frames_pre_downscaled
+        {
             // downscale both frames for faster comparison
             if let Some(frame_buffer) = &mut self.downscaled_frame_buffer {
                 frame_buffer.swap(0, 1);
@@ -49,6 +51,10 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 unreachable!()
             }
         } else {
+            // Either the detector itself does not downscale (small resolutions),
+            // or the reader already downscaled the luma (parallel Fast, P2). In
+            // both cases SAD the supplied planes directly; `scaled_pixels` holds
+            // the matching (downscaled or full) pixel count.
             let delta = self.delta_in_planes(&frame1.y_plane, &frame2.y_plane);
 
             let mut result = ScenecutResult::new(

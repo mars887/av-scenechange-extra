@@ -20,6 +20,9 @@ use super::importance::{
     IMP_BLOCK_MV_UNITS_PER_PIXEL,
     IMP_BLOCK_SIZE_IN_MV_UNITS,
     IMPORTANCE_BLOCK_SIZE,
+    ImportanceBlockDiff,
+    finalize_importance_block_diff,
+    importance_block_delta,
 };
 use crate::{
     data::{
@@ -206,6 +209,11 @@ pub fn estimate_inter_costs<T: Pixel>(
     .mean
 }
 
+// Retained as the standalone static-inter estimator (and the subject of review
+// finding S2). The detection path now uses the fused
+// `estimate_static_inter_and_importance_detailed`, so this only has test callers;
+// kept for parity testing and the S2 follow-up.
+#[allow(dead_code)]
 pub fn estimate_static_inter_costs_detailed<T: Pixel>(
     frame: &Arc<Frame<T>>,
     ref_frame: &Arc<Frame<T>>,
@@ -222,6 +230,111 @@ pub fn estimate_static_inter_costs_detailed<T: Pixel>(
         me_bad_block_ratio: static_bad_block_ratio,
         me_good_block_ratio: static_good_block_ratio,
     }
+}
+
+/// Fused single-pass equivalent of calling [`estimate_static_inter_costs_detailed`]
+/// and `estimate_importance_block_difference_detailed` separately on the same
+/// frame pair (findings P3 + S3).
+///
+/// Both standalone passes traverse the identical 8x8 importance-block grid over
+/// `(frame.y_plane as org, ref_frame.y_plane as ref)`. Fusing them into one
+/// row-major traversal halves the luma plane reads while producing bit-identical
+/// results: the SATD half mirrors `estimate_static_inter_costs_from_planes` (and
+/// the S2 `InterCostEstimate` shape: `motion_mean = mean`, `me_* = static_*`),
+/// and the importance half reuses the same `importance_block_delta` /
+/// `finalize_importance_block_diff` helpers as the standalone importance pass, so
+/// the two paths cannot drift.
+pub(crate) fn estimate_static_inter_and_importance_detailed<T: Pixel>(
+    frame: &Arc<Frame<T>>,
+    ref_frame: &Arc<Frame<T>>,
+    bit_depth: usize,
+) -> (InterCostEstimate, ImportanceBlockDiff) {
+    let plane_org = &frame.y_plane;
+    let plane_ref = &ref_frame.y_plane;
+    let h_in_imp_b = plane_org.height().get() / IMPORTANCE_BLOCK_SIZE;
+    let w_in_imp_b = plane_org.width().get() / IMPORTANCE_BLOCK_SIZE;
+    let block_count = w_in_imp_b * h_in_imp_b;
+    let bsize = BlockSize::from_width_and_height(IMPORTANCE_BLOCK_SIZE, IMPORTANCE_BLOCK_SIZE);
+
+    let mut inter_costs = 0u64;
+    let mut block_costs = Vec::with_capacity(block_count);
+    let mut imp_block_costs = 0u64;
+    let mut luma_sum = 0i64;
+    let mut imp_blocks = Vec::with_capacity(block_count);
+
+    // Single row-major (y outer, x inner) pass: identical iteration order and
+    // per-block math to both standalone functions.
+    (0..h_in_imp_b).for_each(|y| {
+        (0..w_in_imp_b).for_each(|x| {
+            // Static SATD half (mirrors estimate_static_inter_costs_from_planes).
+            let region_org = plane_org.region(Area::Rect(Rect {
+                x: (x * IMPORTANCE_BLOCK_SIZE) as isize,
+                y: (y * IMPORTANCE_BLOCK_SIZE) as isize,
+                width: IMPORTANCE_BLOCK_SIZE,
+                height: IMPORTANCE_BLOCK_SIZE,
+            }));
+            let region_ref = plane_ref.region(Area::Rect(Rect {
+                x: (x * IMPORTANCE_BLOCK_SIZE) as isize,
+                y: (y * IMPORTANCE_BLOCK_SIZE) as isize,
+                width: IMPORTANCE_BLOCK_SIZE,
+                height: IMPORTANCE_BLOCK_SIZE,
+            }));
+            let block_cost = get_satd(
+                &region_org,
+                &region_ref,
+                bsize.width(),
+                bsize.height(),
+                bit_depth,
+            ) as u64;
+            inter_costs += block_cost;
+            block_costs.push(block_cost as f64);
+
+            // Importance half (same org/ref 8x8 tiles, now hot in cache).
+            let (delta, histogram_org_sum) = importance_block_delta(plane_org, plane_ref, x, y);
+            luma_sum += histogram_org_sum;
+            imp_block_costs += delta as u64;
+            imp_blocks.push(delta as f64);
+        });
+    });
+
+    // Static finalize: identical to estimate_static_inter_costs_from_planes plus
+    // the S2 InterCostEstimate shape. When block_count == 0 this yields the same
+    // NaN mean/ratios as the unguarded standalone static path.
+    let mean = inter_costs as f64 / block_count as f64;
+    let (static_bad_block_ratio, static_good_block_ratio) =
+        block_cost_ratios(&block_costs, mean, block_count);
+    let inter = InterCostEstimate {
+        mean,
+        motion_mean: mean,
+        motion_cost_computed: false,
+        static_bad_block_ratio,
+        static_good_block_ratio,
+        me_bad_block_ratio: static_bad_block_ratio,
+        me_good_block_ratio: static_good_block_ratio,
+    };
+
+    // Importance finalize: mirrors estimate_importance_block_difference_detailed,
+    // including its block_count == 0 zeroed early-out.
+    let importance = if block_count == 0 {
+        ImportanceBlockDiff {
+            mean: 0.0,
+            avg_luma_8bit: 0.0,
+            blocks: Vec::new(),
+            cols: 0,
+            rows: 0,
+        }
+    } else {
+        finalize_importance_block_diff(
+            imp_block_costs,
+            luma_sum,
+            imp_blocks,
+            w_in_imp_b,
+            h_in_imp_b,
+            bit_depth,
+        )
+    };
+
+    (inter, importance)
 }
 
 pub fn estimate_inter_costs_detailed<T: Pixel>(
@@ -1917,5 +2030,90 @@ mod tests {
             estimate.mean,
             zero_motion_mean
         );
+    }
+
+    fn solid_frame(width: usize, height: usize, fill: u8) -> Arc<Frame<u8>> {
+        let mut frame = FrameBuilder::new(
+            NonZeroUsize::new(width).expect("non-zero width"),
+            NonZeroUsize::new(height).expect("non-zero height"),
+            ChromaSubsampling::Monochrome,
+            NonZeroU8::new(8).expect("non-zero bit depth"),
+        )
+        .build()
+        .expect("test frame should build");
+        for row in frame.y_plane.rows_mut() {
+            row.fill(fill);
+        }
+        Arc::new(frame)
+    }
+
+    fn assert_fused_matches_separate(org: &Arc<Frame<u8>>, reff: &Arc<Frame<u8>>) {
+        use crate::analyze::importance::estimate_importance_block_difference_detailed;
+
+        let want_inter = estimate_static_inter_costs_detailed(org, reff, 8);
+        let want_imp = estimate_importance_block_difference_detailed(org, reff, 8);
+        let (got_inter, got_imp) = estimate_static_inter_and_importance_detailed(org, reff, 8);
+
+        // Bit-exact, NaN-aware (the degenerate 0-block case yields NaN means).
+        let eqf = |a: f64, b: f64| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
+        assert!(eqf(got_inter.mean, want_inter.mean), "inter.mean");
+        assert!(
+            eqf(got_inter.motion_mean, want_inter.motion_mean),
+            "inter.motion_mean"
+        );
+        assert_eq!(got_inter.motion_cost_computed, want_inter.motion_cost_computed);
+        assert!(
+            eqf(
+                got_inter.static_bad_block_ratio,
+                want_inter.static_bad_block_ratio
+            ),
+            "static_bad_block_ratio"
+        );
+        assert!(
+            eqf(
+                got_inter.static_good_block_ratio,
+                want_inter.static_good_block_ratio
+            ),
+            "static_good_block_ratio"
+        );
+        assert!(
+            eqf(got_inter.me_bad_block_ratio, want_inter.me_bad_block_ratio),
+            "me_bad_block_ratio"
+        );
+        assert!(
+            eqf(got_inter.me_good_block_ratio, want_inter.me_good_block_ratio),
+            "me_good_block_ratio"
+        );
+
+        assert!(eqf(got_imp.mean, want_imp.mean), "imp.mean");
+        assert!(
+            eqf(got_imp.avg_luma_8bit, want_imp.avg_luma_8bit),
+            "imp.avg_luma_8bit"
+        );
+        assert_eq!(got_imp.cols, want_imp.cols);
+        assert_eq!(got_imp.rows, want_imp.rows);
+        assert_eq!(got_imp.blocks.len(), want_imp.blocks.len());
+        for (i, (a, b)) in got_imp.blocks.iter().zip(want_imp.blocks.iter()).enumerate() {
+            assert!(eqf(*a, *b), "imp.blocks[{i}]: {a} != {b}");
+        }
+    }
+
+    #[test]
+    fn fused_static_importance_matches_separate_u8() {
+        // Real-sized frames with motion and a luma delta: proves the fused pass
+        // is bit-identical to the two standalone passes it replaces.
+        let org = shifted_block_frame(36);
+        let reference = shifted_block_frame(28);
+        assert_fused_matches_separate(&org, &reference);
+    }
+
+    #[test]
+    fn fused_static_importance_matches_separate_degenerate() {
+        // 4x4 plane => w/8 == h/8 == 0 => block_count == 0. The importance half
+        // returns a zeroed diff; the static half reproduces the unguarded
+        // standalone's NaN mean/ratios. Both halves must match exactly.
+        let org = solid_frame(4, 4, 16);
+        let reference = solid_frame(4, 4, 200);
+        assert_fused_matches_separate(&org, &reference);
     }
 }

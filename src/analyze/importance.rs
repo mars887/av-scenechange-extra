@@ -57,27 +57,68 @@ pub(crate) fn estimate_importance_block_difference_detailed<T: Pixel>(
         };
     }
 
-    let mut imp_block_costs = 0;
+    let mut imp_block_costs = 0u64;
     let mut luma_sum = 0i64;
     let mut blocks = Vec::with_capacity(block_count);
 
     (0..h_in_imp_b).for_each(|y| {
         (0..w_in_imp_b).for_each(|x| {
-            let histogram_org_sum = sum_8x8_block(plane_org, x, y);
-            let histogram_ref_sum = sum_8x8_block(plane_ref, x, y);
+            let (delta, histogram_org_sum) = importance_block_delta(plane_org, plane_ref, x, y);
             luma_sum += histogram_org_sum;
-
-            let count = (IMPORTANCE_BLOCK_SIZE * IMPORTANCE_BLOCK_SIZE) as i64;
-
-            let mean = (((histogram_org_sum + count / 2) / count)
-                - ((histogram_ref_sum + count / 2) / count))
-                .abs();
-
-            imp_block_costs += mean as u64;
-            blocks.push(mean as f64);
+            imp_block_costs += delta as u64;
+            blocks.push(delta as f64);
         });
     });
 
+    finalize_importance_block_diff(
+        imp_block_costs,
+        luma_sum,
+        blocks,
+        w_in_imp_b,
+        h_in_imp_b,
+        bit_depth,
+    )
+}
+
+/// Per-block importance delta over the 8x8 importance-grid cell `(x, y)`.
+///
+/// Shared by [`estimate_importance_block_difference_detailed`] and the fused
+/// static+importance traversal in `super::inter`, so the integer rounding lives
+/// in one place and cannot drift between the two callers. Returns
+/// `(per_block_abs_mean_delta, org_block_sum)`; the caller accumulates
+/// `org_block_sum` into the luma total (org-only, matching the original).
+#[inline]
+pub(crate) fn importance_block_delta<T: Pixel>(
+    plane_org: &Plane<T>,
+    plane_ref: &Plane<T>,
+    x: usize,
+    y: usize,
+) -> (i64, i64) {
+    let histogram_org_sum = sum_8x8_block(plane_org, x, y);
+    let histogram_ref_sum = sum_8x8_block(plane_ref, x, y);
+
+    let count = (IMPORTANCE_BLOCK_SIZE * IMPORTANCE_BLOCK_SIZE) as i64;
+    let mean = (((histogram_org_sum + count / 2) / count)
+        - ((histogram_ref_sum + count / 2) / count))
+        .abs();
+
+    (mean, histogram_org_sum)
+}
+
+/// Finalizes importance accumulators into an [`ImportanceBlockDiff`]. Shared by
+/// the standalone importance pass and the fused static+importance pass.
+///
+/// Callers must guarantee `w_in_imp_b * h_in_imp_b != 0`; the empty-grid case is
+/// handled before any accumulation.
+pub(crate) fn finalize_importance_block_diff(
+    imp_block_costs: u64,
+    luma_sum: i64,
+    blocks: Vec<f64>,
+    w_in_imp_b: usize,
+    h_in_imp_b: usize,
+    bit_depth: usize,
+) -> ImportanceBlockDiff {
+    let block_count = w_in_imp_b * h_in_imp_b;
     let sample_max = 2.0_f64.powi(bit_depth as i32) - 1.0;
     let pixel_count = (block_count * IMPORTANCE_BLOCK_SIZE * IMPORTANCE_BLOCK_SIZE) as f64;
     let avg_luma_8bit = if sample_max > 0.0 && pixel_count > 0.0 {

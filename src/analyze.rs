@@ -75,6 +75,94 @@ impl<T: Pixel> ScaleFunction<T> {
     }
 }
 
+/// Reader-side plan for shrinking the parallel frame store (P2/P3).
+///
+/// The only chroma consumer in the analysis path is forward-similarity, and the
+/// only consumer of a box-downscaled luma plane is the Fast detector. So the
+/// parallel reader may store a reduced frame whenever those paths are inactive:
+///   * `drop_chroma` (forward-similarity disabled) drops both chroma planes;
+///   * `prescale` (Fast, >240p, with forward- AND transient-similarity disabled)
+///     replaces luma with its box-downscale so `fast_scenecut` skips its own.
+///
+/// When neither applies the frame is stored unchanged, preserving the
+/// serial/parallel result parity the chunk handoff relies on. The gate keys off
+/// the tuning flags (not the speed enum), because speed and tuning are
+/// independent: e.g. `Standard` speed with `high_quality()` tuning still reads
+/// chroma and must keep it.
+pub(crate) struct ParallelFrameReducer<T: Pixel> {
+    drop_chroma: bool,
+    prescale: Option<ScaleFunction<T>>,
+}
+
+impl<T: Pixel> ParallelFrameReducer<T> {
+    pub(crate) fn new(
+        resolution: (usize, usize),
+        speed: SceneDetectionSpeed,
+        forward_similarity_enabled: bool,
+        transient_similarity_enabled: bool,
+    ) -> Self {
+        // Pre-downscale only when nothing needs full-resolution luma. The Fast
+        // detector is the sole downscaled-luma consumer; forward/transient
+        // similarity read full-res luma (and forward additionally reads chroma).
+        let prescale = if forward_similarity_enabled || transient_similarity_enabled {
+            None
+        } else {
+            // `detect_scale_factor` is `None` unless `speed == Fast` and the
+            // smaller edge is >240px, so Standard/High never pre-downscale.
+            detect_scale_factor::<T>(resolution, speed)
+        };
+        Self {
+            drop_chroma: !forward_similarity_enabled,
+            prescale,
+        }
+    }
+
+    /// Whether workers fed by this store receive already-downscaled luma.
+    pub(crate) fn is_prescaled(&self) -> bool {
+        self.prescale.is_some()
+    }
+
+    /// Whether chroma is dropped from the stored frames.
+    pub(crate) fn drops_chroma(&self) -> bool {
+        self.drop_chroma
+    }
+
+    /// The Fast downscale factor applied to stored luma, if any.
+    pub(crate) fn scale_factor(&self) -> Option<usize> {
+        self.prescale.as_ref().map(|scale| scale.factor.get())
+    }
+
+    /// Reduces a freshly decoded frame to the payload the store should hold.
+    /// Consumes `frame`, moving the luma plane (never copying) when only chroma
+    /// is dropped. Chroma is read only by `forward_similarity`, so a luma-only
+    /// frame is parity-safe whenever `drop_chroma` is set.
+    pub(crate) fn apply(&self, frame: Frame<T>) -> Frame<T> {
+        if let Some(scale) = &self.prescale {
+            let bit_depth = frame.bit_depth;
+            return Frame {
+                y_plane: (scale.downscale)(&frame.y_plane, bit_depth),
+                u_plane: None,
+                v_plane: None,
+                subsampling: ChromaSubsampling::Monochrome,
+                bit_depth,
+            };
+        }
+        if self.drop_chroma {
+            let Frame {
+                y_plane, bit_depth, ..
+            } = frame;
+            return Frame {
+                y_plane,
+                u_plane: None,
+                v_plane: None,
+                subsampling: ChromaSubsampling::Monochrome,
+                bit_depth,
+            };
+        }
+        frame
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ForwardSimilarityMatch {
     frame: usize,
@@ -244,6 +332,12 @@ pub struct SceneChangeDetector<T: Pixel> {
     scaled_pixels: usize,
     /// Downscaling function for fast scene detection
     scale_func: Option<ScaleFunction<T>>,
+    /// Set on parallel Fast workers whose store frames already carry box-
+    /// downscaled luma (P2). When `true`, `fast_scenecut` SADs the supplied luma
+    /// planes directly instead of downscaling again; `scaled_pixels` already
+    /// holds the downscaled count, so the result is bit-identical. The serial
+    /// path feeds full frames and leaves this `false`.
+    frames_pre_downscaled: bool,
 
     // Internal data structures
     /// Start deque offset based on lookahead
@@ -342,6 +436,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
             min_key_frame_interval,
             max_key_frame_interval,
             downscaled_frame_buffer: None,
+            frames_pre_downscaled: false,
             resolution,
             temp_plane: None,
             frame_me_stats_buffer: None,
@@ -360,6 +455,13 @@ impl<T: Pixel> SceneChangeDetector<T> {
 
     pub(crate) fn set_cost_parallelism(&mut self, enabled: bool) {
         self.use_cost_parallelism = enabled;
+    }
+
+    /// Marks that stored frames already carry box-downscaled luma (P2 parallel
+    /// reduced store), so `fast_scenecut` must not downscale them again. Only the
+    /// parallel Fast workers set this; the serial path leaves it `false`.
+    pub(crate) fn set_frames_pre_downscaled(&mut self, enabled: bool) {
+        self.frames_pre_downscaled = enabled;
     }
 
     /// Runs keyframe detection on the next frame in the lookahead queue.

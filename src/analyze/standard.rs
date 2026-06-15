@@ -4,10 +4,11 @@ use v_frame::{frame::Frame, pixel::Pixel};
 
 use super::{SceneChangeDetector, ScenecutAnalysis, ScenecutResult};
 use crate::{
+    SceneDetectionSpeed,
     analyze::{
         frame_luma_signature_8bit,
         importance::estimate_importance_block_difference_detailed,
-        inter::{estimate_inter_costs_detailed, estimate_static_inter_costs_detailed},
+        inter::{estimate_inter_costs_detailed, estimate_static_inter_and_importance_detailed},
         intra::estimate_intra_costs,
     },
     data::motion::FrameMEStats,
@@ -66,6 +67,8 @@ impl<T: Pixel> SceneChangeDetector<T> {
                         / intra_costs.len() as f64;
                 });
                 if let Some(buffer) = motion_buffer {
+                    // Diagnostics path: full motion estimation cannot be fused
+                    // with the importance pass, so keep them as separate tasks.
                     s.spawn(|_| {
                         mv_inter_cost = Some(estimate_inter_costs_detailed(
                             frame2,
@@ -76,22 +79,26 @@ impl<T: Pixel> SceneChangeDetector<T> {
                             buffer,
                         ));
                     });
-                } else {
                     s.spawn(|_| {
-                        mv_inter_cost = Some(estimate_static_inter_costs_detailed(
+                        imp_block_diff = Some(estimate_importance_block_difference_detailed(
                             frame2,
                             frame1,
                             self.bit_depth,
                         ));
                     });
+                } else {
+                    // Default path: static-SATD and importance traverse the same
+                    // 8x8 grid, so fuse them into one task to halve plane reads.
+                    s.spawn(|_| {
+                        let (inter, imp) = estimate_static_inter_and_importance_detailed(
+                            frame2,
+                            frame1,
+                            self.bit_depth,
+                        );
+                        mv_inter_cost = Some(inter);
+                        imp_block_diff = Some(imp);
+                    });
                 }
-                s.spawn(|_| {
-                    imp_block_diff = Some(estimate_importance_block_difference_detailed(
-                        frame2,
-                        frame1,
-                        self.bit_depth,
-                    ));
-                });
             });
         } else {
             {
@@ -107,23 +114,28 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 intra_cost = intra_costs.iter().map(|&cost| cost as u64).sum::<u64>() as f64
                     / intra_costs.len() as f64;
             }
-            mv_inter_cost = Some(if let Some(buffer) = motion_buffer {
-                estimate_inter_costs_detailed(
+            if let Some(buffer) = motion_buffer {
+                // Diagnostics path: full motion estimation + separate importance.
+                mv_inter_cost = Some(estimate_inter_costs_detailed(
                     frame2,
                     frame1,
                     self.bit_depth,
                     self.frame_rate,
                     self.chroma_sampling,
                     buffer,
-                )
+                ));
+                imp_block_diff = Some(estimate_importance_block_difference_detailed(
+                    frame2,
+                    frame1,
+                    self.bit_depth,
+                ));
             } else {
-                estimate_static_inter_costs_detailed(frame2, frame1, self.bit_depth)
-            });
-            imp_block_diff = Some(estimate_importance_block_difference_detailed(
-                frame2,
-                frame1,
-                self.bit_depth,
-            ));
+                // Default path: one fused pass over the shared 8x8 grid.
+                let (inter, imp) =
+                    estimate_static_inter_and_importance_detailed(frame2, frame1, self.bit_depth);
+                mv_inter_cost = Some(inter);
+                imp_block_diff = Some(imp);
+            }
         }
 
         // `BIAS` determines how likely we are
@@ -149,7 +161,14 @@ impl<T: Pixel> SceneChangeDetector<T> {
         result.static_good_block_ratio = mv_inter_cost.static_good_block_ratio;
         result.me_bad_block_ratio = mv_inter_cost.me_bad_block_ratio;
         result.me_good_block_ratio = mv_inter_cost.me_good_block_ratio;
-        result.frame_luma_signature = Some(frame_luma_signature_8bit(frame2, self.bit_depth));
+        // S3: the 32-cell luma signature is consumed only by High-mode
+        // postprocess passes (apply_scenechange_postprocess, gated on
+        // analysis_speed == High). Skip it otherwise — pure overhead in Standard.
+        result.frame_luma_signature = if self.scene_detection_mode == SceneDetectionSpeed::High {
+            Some(frame_luma_signature_8bit(frame2, self.bit_depth))
+        } else {
+            None
+        };
 
         ScenecutAnalysis {
             result,

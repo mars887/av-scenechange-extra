@@ -864,7 +864,9 @@ pub fn detect_scene_changes_parallel<T: Pixel + Send + Sync + 'static>(
     } else {
         (None, None)
     };
-    let max_buffered_frames = parallel_reader_buffer_frames(opts, &video_details);
+    let frame_reducer = parallel_frame_reducer::<T>(opts, &video_details);
+    let max_buffered_frames =
+        parallel_reader_buffer_frames::<T>(opts, &video_details, &frame_reducer);
     let use_indexed_reader = decoder_supports_indexed_frames(dec);
     let (frame_request_tx, frame_request_rx) = if use_indexed_reader {
         let (tx, rx) = channel();
@@ -972,6 +974,7 @@ pub fn detect_scene_changes_parallel<T: Pixel + Send + Sync + 'static>(
                 &reconcile_handle,
                 &progress_rx,
                 progress_callback,
+                &frame_reducer,
             )
         } else {
             read_parallel_streamed_frames::<T>(
@@ -982,6 +985,7 @@ pub fn detect_scene_changes_parallel<T: Pixel + Send + Sync + 'static>(
                 max_buffered_frames,
                 &progress_rx,
                 progress_callback,
+                &frame_reducer,
             )
         };
         if let Ok(produced) = &read_result {
@@ -1231,6 +1235,7 @@ fn read_parallel_streamed_frames<T: Pixel>(
     max_buffered_frames: usize,
     progress_rx: &Option<Receiver<(usize, usize)>>,
     progress_callback: Option<&dyn Fn(usize, usize)>,
+    frame_reducer: &analyze::ParallelFrameReducer<T>,
 ) -> anyhow::Result<usize> {
     let mut produced = 0usize;
     loop {
@@ -1246,7 +1251,7 @@ fn read_parallel_streamed_frames<T: Pixel>(
         )?;
         match dec.read_video_frame() {
             Ok(frame) => {
-                store.push(produced, Arc::new(frame));
+                store.push(produced, Arc::new(frame_reducer.apply(frame)));
                 produced += 1;
                 prune_parallel_frame_store(store, needed_from);
                 drain_parallel_progress(progress_rx, progress_callback);
@@ -1272,6 +1277,7 @@ fn read_parallel_indexed_frames<'scope, T: Pixel>(
     reconcile_handle: &thread::ScopedJoinHandle<'scope, anyhow::Result<DetectionResults>>,
     progress_rx: &Option<Receiver<(usize, usize)>>,
     progress_callback: Option<&dyn Fn(usize, usize)>,
+    frame_reducer: &analyze::ParallelFrameReducer<T>,
 ) -> anyhow::Result<usize> {
     loop {
         drain_parallel_progress(progress_rx, progress_callback);
@@ -1290,7 +1296,7 @@ fn read_parallel_indexed_frames<'scope, T: Pixel>(
                 }
                 match dec.get_video_frame(frame) {
                     Ok(data) => {
-                        store.push(frame, Arc::new(data));
+                        store.push(frame, Arc::new(frame_reducer.apply(data)));
                         prune_parallel_indexed_frame_store(store, needed_from);
                     }
                     Err(av_decoders::DecoderError::EndOfFile) => {
@@ -1337,6 +1343,7 @@ fn read_parallel_indexed_frames<'scope, T: Pixel>(
     reconcile_handle: &thread::ScopedJoinHandle<'scope, anyhow::Result<DetectionResults>>,
     progress_rx: &Option<Receiver<(usize, usize)>>,
     progress_callback: Option<&dyn Fn(usize, usize)>,
+    frame_reducer: &analyze::ParallelFrameReducer<T>,
 ) -> anyhow::Result<usize> {
     let _ = (
         dec,
@@ -1347,6 +1354,7 @@ fn read_parallel_indexed_frames<'scope, T: Pixel>(
         reconcile_handle,
         progress_rx,
         progress_callback,
+        frame_reducer,
     );
     Ok(frame_count)
 }
@@ -1386,30 +1394,62 @@ fn parallel_initial_fetch_start(start_frame: usize, opts: DetectionOptions) -> u
     start_frame.saturating_sub(parallel_frame_history(opts).saturating_add(1))
 }
 
-fn parallel_reader_buffer_frames(
+/// Builds the [`analyze::ParallelFrameReducer`] for these options. Centralized
+/// so the reader, the buffer-budget estimate, and the worker `frames_pre_downscaled`
+/// flag are all derived identically and cannot drift (P2/P3).
+fn parallel_frame_reducer<T: Pixel>(
     opts: DetectionOptions,
     video_details: &av_decoders::VideoDetails,
+) -> analyze::ParallelFrameReducer<T> {
+    analyze::ParallelFrameReducer::new(
+        (video_details.width, video_details.height),
+        opts.analysis_speed,
+        opts.tuning.forward_similarity.enabled,
+        opts.tuning.transient_similarity.enabled,
+    )
+}
+
+fn parallel_reader_buffer_frames<T: Pixel>(
+    opts: DetectionOptions,
+    video_details: &av_decoders::VideoDetails,
+    reducer: &analyze::ParallelFrameReducer<T>,
 ) -> usize {
     let minimum = opts
         .effective_lookahead_distance()
         .saturating_add(parallel_frame_history(opts))
         .saturating_add(8);
-    let frame_bytes = estimated_frame_bytes(video_details).max(1);
+    let frame_bytes = estimated_frame_bytes(video_details, reducer).max(1);
     let byte_limited = PARALLEL_READER_TARGET_BUFFER_BYTES / frame_bytes;
     byte_limited
         .max(minimum)
         .min(PARALLEL_READER_MAX_BUFFER_FRAMES.max(minimum))
 }
 
-fn estimated_frame_bytes(video_details: &av_decoders::VideoDetails) -> usize {
-    let luma_pixels = video_details.width.saturating_mul(video_details.height);
-    let chroma_pixels = match video_details.chroma_sampling {
-        v_frame::chroma::ChromaSubsampling::Yuv420 => luma_pixels / 2,
-        v_frame::chroma::ChromaSubsampling::Yuv422 => luma_pixels,
-        v_frame::chroma::ChromaSubsampling::Yuv444 => luma_pixels.saturating_mul(2),
-        v_frame::chroma::ChromaSubsampling::Monochrome => 0,
-    };
+/// Estimates the bytes a single frame occupies in the store *after* the P2/P3
+/// reduction, so a smaller payload lets the byte budget buffer more frames
+/// (which also relieves the P1 reader-serialization bottleneck).
+fn estimated_frame_bytes<T: Pixel>(
+    video_details: &av_decoders::VideoDetails,
+    reducer: &analyze::ParallelFrameReducer<T>,
+) -> usize {
     let bytes_per_sample = video_details.bit_depth.div_ceil(8).max(1);
+    // Pre-downscaled store: luma only, shrunk by factor^2 (chroma also dropped).
+    if let Some(factor) = reducer.scale_factor() {
+        let luma_pixels =
+            (video_details.width / factor).saturating_mul(video_details.height / factor);
+        return luma_pixels.saturating_mul(bytes_per_sample).max(1);
+    }
+    let luma_pixels = video_details.width.saturating_mul(video_details.height);
+    let chroma_pixels = if reducer.drops_chroma() {
+        0
+    } else {
+        match video_details.chroma_sampling {
+            v_frame::chroma::ChromaSubsampling::Yuv420 => luma_pixels / 2,
+            v_frame::chroma::ChromaSubsampling::Yuv422 => luma_pixels,
+            v_frame::chroma::ChromaSubsampling::Yuv444 => luma_pixels.saturating_mul(2),
+            v_frame::chroma::ChromaSubsampling::Monochrome => 0,
+        }
+    };
     luma_pixels
         .saturating_add(chroma_pixels)
         .saturating_mul(bytes_per_sample)
@@ -1727,6 +1767,9 @@ fn run_parallel_worker<T: Pixel>(
     let initial_fetch_start = parallel_initial_fetch_start(start_frame, opts);
     let mut detector =
         new_detector_from_video_details::<T>(video_details, opts, use_cost_parallelism);
+    detector.set_frames_pre_downscaled(
+        parallel_frame_reducer::<T>(opts, video_details).is_prescaled(),
+    );
     let mut frame_queue = FrameWindow::new(initial_fetch_start);
     let mut keyframes = BTreeSet::new();
     keyframes.insert(start_frame);
@@ -1833,6 +1876,7 @@ where
     F: Fn(usize) -> anyhow::Result<Decoder> + Sync,
 {
     let mut source = make_decoder(worker)?;
+    let frame_reducer = parallel_frame_reducer::<T>(opts, video_details);
     let effective_lookahead = opts.effective_lookahead_distance();
     let frame_history = parallel_frame_history(opts);
     assert!(effective_lookahead >= 1);
@@ -1840,6 +1884,7 @@ where
     let initial_fetch_start = parallel_initial_fetch_start(start_frame, opts);
     let mut detector =
         new_detector_from_video_details::<T>(video_details, opts, use_cost_parallelism);
+    detector.set_frames_pre_downscaled(frame_reducer.is_prescaled());
     let mut frame_queue = FrameWindow::new(initial_fetch_start);
     let mut keyframes = BTreeSet::new();
     keyframes.insert(start_frame);
@@ -1883,7 +1928,7 @@ where
                     ));
                 }
             };
-            frame_queue.push_next(next_input_frameno, Arc::new(frame));
+            frame_queue.push_next(next_input_frameno, Arc::new(frame_reducer.apply(frame)));
             next_input_frameno += 1;
         }
 
@@ -4749,5 +4794,68 @@ mod tests {
                 .iter()
                 .any(|&frames| frames > 0 && frames < sequential.frame_count)
         );
+    }
+
+    #[test]
+    fn parallel_fast_matches_sequential() {
+        // Fast + default tuning (forward/transient disabled) makes the parallel
+        // reader drop chroma from the store. The fixture is 240p so no downscale
+        // happens, but this still guards that the luma-only store reproduces the
+        // serial Fast result exactly (P2 chroma-drop parity).
+        let mut sequential_decoder = decoder();
+        let mut parallel_decoder = decoder();
+        let mut options = standard_options();
+        options.analysis_speed = SceneDetectionSpeed::Fast;
+        let sequential = detect_scene_changes::<u8>(&mut sequential_decoder, options, None, None)
+            .expect("sequential detection should work");
+        let frame_count = sequential.frame_count;
+        let parallel = detect_scene_changes_parallel::<u8>(
+            &mut parallel_decoder,
+            options,
+            Some(frame_count),
+            ParallelDetectionOptions { workers: 3 },
+            None,
+        )
+        .expect("parallel detection should work");
+
+        assert_eq!(parallel.scene_changes, sequential.scene_changes);
+        assert_eq!(parallel.scores, sequential.scores);
+        assert_eq!(parallel.frame_count, sequential.frame_count);
+    }
+
+    #[test]
+    fn parallel_frame_reducer_gate_keys_off_tuning_not_speed() {
+        use crate::analyze::ParallelFrameReducer;
+
+        // Fast + similarity disabled => drop chroma AND pre-downscale (>240p).
+        let fast = ParallelFrameReducer::<u8>::new((1920, 1080), SceneDetectionSpeed::Fast, false, false);
+        assert!(fast.drops_chroma());
+        assert_eq!(fast.scale_factor(), Some(8));
+        assert!(fast.is_prescaled());
+
+        // forward-similarity on => keep chroma and never pre-downscale, even Fast.
+        let fast_forward =
+            ParallelFrameReducer::<u8>::new((1920, 1080), SceneDetectionSpeed::Fast, true, false);
+        assert!(!fast_forward.drops_chroma());
+        assert!(!fast_forward.is_prescaled());
+
+        // transient-only on => may drop chroma (transient is luma-only) but must
+        // not pre-downscale (transient needs full-res luma).
+        let fast_transient =
+            ParallelFrameReducer::<u8>::new((1920, 1080), SceneDetectionSpeed::Fast, false, true);
+        assert!(fast_transient.drops_chroma());
+        assert!(!fast_transient.is_prescaled());
+
+        // Standard => never pre-downscale; chroma dropped when forward off.
+        let standard =
+            ParallelFrameReducer::<u8>::new((1920, 1080), SceneDetectionSpeed::Standard, false, false);
+        assert!(standard.drops_chroma());
+        assert!(!standard.is_prescaled());
+
+        // <=240p Fast => no downscale factor, so chroma-drop only.
+        let small_fast =
+            ParallelFrameReducer::<u8>::new((352, 240), SceneDetectionSpeed::Fast, false, false);
+        assert!(!small_fast.is_prescaled());
+        assert!(small_fast.drops_chroma());
     }
 }
