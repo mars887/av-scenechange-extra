@@ -68,9 +68,29 @@ const PARALLEL_MIN_CHUNK_FRAMES: usize = 24;
 const PARALLEL_SYNC_MATCHES: usize = 2;
 const PARALLEL_FORWARD_SUPPRESSED_SYNC_MATCHES: usize = 3;
 const PARALLEL_READER_TARGET_BUFFER_BYTES: usize = 384 * 1024 * 1024;
-const PARALLEL_READER_MAX_BUFFER_FRAMES: usize = 512;
+/// Frame-count ceiling on a single worker's streamed read-ahead window. This is
+/// only a backstop against a pathologically tiny per-frame payload demanding
+/// millions of `BTreeMap` entries; the real bound is the byte budget above.
+/// Raised well past the old 512 because, after the P2/P3 store reduction, a Fast
+/// 1080p frame is only ~32 KiB, so 512 frames used barely ~16 MiB of the 384 MiB
+/// budget — that artificial cap, not the byte budget, was what kept the reader
+/// from decoding far enough ahead to feed later chunk workers (P1).
+const PARALLEL_READER_MAX_BUFFER_FRAMES: usize = 16 * 1024;
+/// Per-frame bookkeeping overhead (Arc control block, `BTreeMap` node, key)
+/// folded into the byte-budget divisor so a very small pixel payload cannot
+/// inflate the resident frame count without bound (P1).
+const PARALLEL_READER_FRAME_ENTRY_OVERHEAD_BYTES: usize = 256;
 const PARALLEL_READER_WAIT: Duration = Duration::from_millis(20);
 const FRAME_REF_INLINE_CAPACITY: usize = 96;
+/// Upper bound on the dense progress-dedup bitmap allocated in
+/// [`reconcile_parallel_workers`]. That bitmap only deduplicates per-frame
+/// progress callbacks — out-of-range indices are ignored and the authoritative
+/// totals come from the keyframe set and `actual_frame_limit` — so capping it
+/// cannot change detection results. It exists solely to stop a sentinel/huge
+/// `frame_limit` (e.g. `usize::MAX`, a valid serial-API "no limit") from
+/// requesting a multi-gigabyte allocation (C7). `1 << 24` ≈ 16.7M frames
+/// (~77h @ 60fps) exceeds any real video, so legitimate inputs are unaffected.
+const PARALLEL_PROGRESS_TRACK_CAP: usize = 1 << 24;
 /// Version marker for diagnostics fields emitted by this fork.
 pub const DIAGNOSTICS_VERSION: &str = "av-scenechange-extra-high-postprocess-diagnostics-v9";
 
@@ -837,7 +857,8 @@ pub fn detect_scene_changes_parallel<T: Pixel + Send + Sync + 'static>(
     progress_callback: Option<&dyn Fn(usize, usize)>,
 ) -> anyhow::Result<DetectionResults> {
     let video_details = *dec.get_video_details();
-    let Some(frame_count) = frame_limit.or(video_details.total_frames) else {
+    let Some(frame_count) = resolve_parallel_frame_count(frame_limit, video_details.total_frames)
+    else {
         return detect_scene_changes::<T>(dec, opts, frame_limit, progress_callback);
     };
     let workers = resolve_parallel_workers(parallel.workers, frame_count);
@@ -865,7 +886,7 @@ pub fn detect_scene_changes_parallel<T: Pixel + Send + Sync + 'static>(
         (None, None)
     };
     let frame_reducer = parallel_frame_reducer::<T>(opts, &video_details);
-    let max_buffered_frames =
+    let per_worker_buffered_frames =
         parallel_reader_buffer_frames::<T>(opts, &video_details, &frame_reducer);
     let use_indexed_reader = decoder_supports_indexed_frames(dec);
     let (frame_request_tx, frame_request_rx) = if use_indexed_reader {
@@ -982,7 +1003,7 @@ pub fn detect_scene_changes_parallel<T: Pixel + Send + Sync + 'static>(
                 frame_count,
                 &store,
                 &needed_from,
-                max_buffered_frames,
+                per_worker_buffered_frames,
                 &progress_rx,
                 progress_callback,
                 &frame_reducer,
@@ -1065,12 +1086,34 @@ where
     F: Fn(usize) -> anyhow::Result<Decoder> + Sync,
 {
     let video_details = *dec.get_video_details();
-    let Some(frame_count) = frame_limit.or(video_details
+    let available = video_details
         .total_frames
-        .map(|total_frames| total_frames.saturating_sub(frame_start)))
-    else {
+        .map(|total_frames| total_frames.saturating_sub(frame_start));
+    let Some(frame_count) = resolve_parallel_frame_count(frame_limit, available) else {
+        // No finite decodable length is known, so the range cannot be split into
+        // chunks. The serial reader streams sequentially from the decoder's
+        // current position (frame 0) and cannot honor `frame_start`, so analyzing
+        // a non-zero sub-range here would silently return the wrong frames (C6).
+        // Reject that rather than corrupt the result; `frame_start == 0` is the
+        // whole stream, which serial handles correctly.
+        if frame_start != 0 {
+            return Err(anyhow::anyhow!(
+                "parallel scene detection with decoder instances requires a known frame \
+                 count when frame_start > 0"
+            ));
+        }
         return detect_scene_changes::<T>(dec, opts, frame_limit, progress_callback);
     };
+    if frame_count <= 1 {
+        // A 0- or 1-frame range has nothing to reconcile: the lone worker breaks
+        // on `frame_set.len() < 2` before emitting any decision, so reconcile
+        // never reaches `complete` and would otherwise return `Err` (C8). The
+        // result is the unconditional keyframe 0 with `frame_count == 0`,
+        // independent of `frame_start`, which the serial path produces directly.
+        // (Single chunks of >= 2 frames stay on the worker+reconcile path below,
+        // which already honors `frame_start`.)
+        return detect_scene_changes::<T>(dec, opts, Some(frame_count), progress_callback);
+    }
     let workers = resolve_parallel_workers(parallel.workers, frame_count);
     let chunk_starts = parallel_chunk_starts(frame_count, workers);
     let use_worker_cost_parallelism = parallel_worker_cost_parallelism(opts, workers);
@@ -1194,6 +1237,27 @@ where
     })
 }
 
+/// Resolves the concrete frame count to split across parallel workers.
+///
+/// `frame_limit` may carry the serial API's "no limit" sentinel (`usize::MAX`);
+/// splitting that overflows [`parallel_chunk_starts`] and oversizes the
+/// reconcile progress bitmap (C7). Treat the sentinel as "unbounded" and, when a
+/// real decodable length is known (`total_frames`, already offset by any
+/// `frame_start` at the call site), clamp the limit to it. Returns `None` when
+/// no finite length is known, signalling the caller to fall back to the serial
+/// path rather than splitting an unbounded range.
+fn resolve_parallel_frame_count(
+    frame_limit: Option<usize>,
+    total_frames: Option<usize>,
+) -> Option<usize> {
+    let frame_limit = frame_limit.filter(|&limit| limit != usize::MAX);
+    match (frame_limit, total_frames) {
+        (Some(limit), Some(total)) => Some(limit.min(total)),
+        (Some(limit), None) => Some(limit),
+        (None, total) => total,
+    }
+}
+
 fn resolve_parallel_workers(requested: usize, frame_count: usize) -> usize {
     if requested == 1 || frame_count < PARALLEL_MIN_CHUNK_FRAMES * 2 {
         return 1;
@@ -1232,7 +1296,7 @@ fn read_parallel_streamed_frames<T: Pixel>(
     frame_count: usize,
     store: &SharedFrameStore<T>,
     needed_from: &[Arc<AtomicUsize>],
-    max_buffered_frames: usize,
+    per_worker_buffered_frames: usize,
     progress_rx: &Option<Receiver<(usize, usize)>>,
     progress_callback: Option<&dyn Fn(usize, usize)>,
     frame_reducer: &analyze::ParallelFrameReducer<T>,
@@ -1245,7 +1309,7 @@ fn read_parallel_streamed_frames<T: Pixel>(
         wait_for_parallel_reader_capacity(
             store,
             needed_from,
-            max_buffered_frames,
+            per_worker_buffered_frames,
             progress_rx,
             progress_callback,
         )?;
@@ -1363,8 +1427,13 @@ fn parallel_chunk_starts(frame_count: usize, workers: usize) -> Vec<usize> {
     if workers <= 1 || frame_count == 0 {
         return vec![0];
     }
+    // Widen the product to `u128` so a sentinel/huge `frame_count` (e.g. a
+    // near-`usize::MAX` limit on an unknown-length source) cannot overflow
+    // `idx * frame_count` before the divide. Byte-identical to
+    // `idx * frame_count / workers` for every non-overflowing input; reordering
+    // to `frame_count / workers * idx` instead would shift the boundaries (C7).
     let mut starts = (0..workers)
-        .map(|idx| idx * frame_count / workers)
+        .map(|idx| (idx as u128 * frame_count as u128 / workers as u128) as usize)
         .collect::<Vec<_>>();
     starts.dedup();
     if starts.first().copied() != Some(0) {
@@ -1409,6 +1478,14 @@ fn parallel_frame_reducer<T: Pixel>(
     )
 }
 
+/// Per-worker streamed read-ahead budget, in frames. The streamed reader scales
+/// the actually-allowed resident range by the number of *active* workers (see
+/// [`parallel_streamed_reader_buffer_frames`]), so this is the window budget for
+/// a single worker: the byte target divided by the post-reduction per-frame cost
+/// (plus a small per-entry overhead), floored by one worker's own
+/// lookahead+history window and capped only as a sanity backstop. Returning the
+/// per-worker (not global) budget is half of the P1 fix; the other half is no
+/// longer truncating it at 512 frames.
 fn parallel_reader_buffer_frames<T: Pixel>(
     opts: DetectionOptions,
     video_details: &av_decoders::VideoDetails,
@@ -1418,7 +1495,9 @@ fn parallel_reader_buffer_frames<T: Pixel>(
         .effective_lookahead_distance()
         .saturating_add(parallel_frame_history(opts))
         .saturating_add(8);
-    let frame_bytes = estimated_frame_bytes(video_details, reducer).max(1);
+    let frame_bytes = estimated_frame_bytes(video_details, reducer)
+        .saturating_add(PARALLEL_READER_FRAME_ENTRY_OVERHEAD_BYTES)
+        .max(1);
     let byte_limited = PARALLEL_READER_TARGET_BUFFER_BYTES / frame_bytes;
     byte_limited
         .max(minimum)
@@ -1458,22 +1537,55 @@ fn estimated_frame_bytes<T: Pixel>(
 fn wait_for_parallel_reader_capacity<T: Pixel>(
     store: &SharedFrameStore<T>,
     needed_from: &[Arc<AtomicUsize>],
-    max_buffered_frames: usize,
+    per_worker_buffered_frames: usize,
     progress_rx: &Option<Receiver<(usize, usize)>>,
     progress_callback: Option<&dyn Fn(usize, usize)>,
 ) -> anyhow::Result<()> {
     loop {
         drain_parallel_progress(progress_rx, progress_callback);
-        let Some(keep_from) = minimum_parallel_needed_frame(needed_from) else {
+        // P1: size the resident range by how many workers are *currently* active,
+        // not by a single global window. The old cap was one window measured from
+        // `min(needed_from)` — which worker 0 pins near frame 0 — so the
+        // forward-only reader never decoded far enough ahead to feed workers whose
+        // chunks begin thousands of frames later; they starved in `store.get` and
+        // the run collapsed to serial. Scaling the cap by the active-worker count
+        // lets the reader reach the later chunks, while the byte budget keeps
+        // total memory bounded (≈ `active_workers · target`, with `active_workers`
+        // ≤ the chunk/worker count). This does NOT change which frames any worker
+        // analyzes, only how far ahead the reader buffers, so results are
+        // unchanged. Retention stays a contiguous prefix `[keep_from, produced]`,
+        // so the forward-only "evicted frame is gone forever" hazard is avoided.
+        let Some((keep_from, active_workers)) = parallel_active_needed_window(needed_from) else {
             return Ok(());
         };
         store.prune_before(keep_from);
         let produced = store.produced_or_error()?;
+        let max_buffered_frames =
+            parallel_streamed_reader_buffer_frames(per_worker_buffered_frames, active_workers);
         if produced.saturating_sub(keep_from) <= max_buffered_frames {
             return Ok(());
         }
         store.wait_for_change(PARALLEL_READER_WAIT);
     }
+}
+
+/// Total streamed resident-range budget: one [`parallel_reader_buffer_frames`]
+/// window per active worker. The forward-only store cannot hold holes, so this is
+/// the count of frames the reader may keep resident between the trailing active
+/// worker (`keep_from`) and `produced`. `saturating_mul` so a sentinel per-worker
+/// value cannot overflow. Peak pixel memory is therefore bounded by roughly
+/// `active_workers · PARALLEL_READER_TARGET_BUFFER_BYTES`, and `active_workers` is
+/// itself bounded by the worker/chunk count (≤ available cores). It does NOT hold
+/// the whole video: a worker whose chunk lies beyond this range still waits until
+/// the trailing worker retires and the window slides forward — i.e. very long
+/// full-res inputs with chunk gaps larger than the budget remain partially
+/// serialized (that needs indexed/per-worker decoders), but the common case where
+/// several chunks fit the budget now overlaps instead of serializing (P1).
+fn parallel_streamed_reader_buffer_frames(
+    per_worker_buffered_frames: usize,
+    active_workers: usize,
+) -> usize {
+    per_worker_buffered_frames.saturating_mul(active_workers.max(1))
 }
 
 fn prune_parallel_frame_store<T: Pixel>(
@@ -1500,11 +1612,26 @@ fn prune_parallel_indexed_frame_store<T: Pixel>(
 }
 
 fn minimum_parallel_needed_frame(needed_from: &[Arc<AtomicUsize>]) -> Option<usize> {
-    needed_from
-        .iter()
-        .map(|needed| needed.load(Ordering::Acquire))
-        .filter(|&frame| frame != usize::MAX)
-        .min()
+    parallel_active_needed_window(needed_from).map(|(keep_from, _)| keep_from)
+}
+
+/// Returns `(min over active needed_from, number of active workers)`, where an
+/// "active" worker is one whose `needed_from` is not the `usize::MAX` retired
+/// sentinel. `keep_from` is the streamed store's prune floor; the active count
+/// drives the per-active-worker read-ahead budget (P1). Single pass over the
+/// atomics so the throttle reads each slot once per wait iteration.
+fn parallel_active_needed_window(needed_from: &[Arc<AtomicUsize>]) -> Option<(usize, usize)> {
+    let mut keep_from = usize::MAX;
+    let mut active_workers = 0usize;
+    for needed in needed_from {
+        let frame = needed.load(Ordering::Acquire);
+        if frame == usize::MAX {
+            continue;
+        }
+        keep_from = keep_from.min(frame);
+        active_workers += 1;
+    }
+    (active_workers != 0).then_some((keep_from, active_workers))
 }
 
 fn drain_parallel_progress(
@@ -2054,7 +2181,12 @@ fn reconcile_parallel_workers(
     let mut keyframes = BTreeSet::new();
     let mut scores = BTreeMap::new();
     let mut reported_progress = 0usize;
-    let mut analyzed_frames = vec![false; frame_limit];
+    // Progress-dedup bitmap only: out-of-range indices are ignored below and the
+    // authoritative totals come from `keyframes` / `actual_frame_limit`, never
+    // from this vector. Cap its length so a sentinel/huge `frame_limit` cannot
+    // demand a multi-gigabyte (or aborting) allocation; real videos are far
+    // smaller than the cap, so every frame is still tracked exactly (C7).
+    let mut analyzed_frames = vec![false; frame_limit.min(PARALLEL_PROGRESS_TRACK_CAP)];
     let mut analyzed_count = 0usize;
     let mut actual_frame_limit = frame_limit;
     let mut complete = false;
@@ -4821,6 +4953,170 @@ mod tests {
         assert_eq!(parallel.scene_changes, sequential.scene_changes);
         assert_eq!(parallel.scores, sequential.scores);
         assert_eq!(parallel.frame_count, sequential.frame_count);
+    }
+
+    #[test]
+    fn resolve_parallel_frame_count_clamps_sentinel_and_falls_back() {
+        // `usize::MAX` is the serial "no limit" sentinel: with a known length it
+        // collapses to that length, without one it signals serial fallback (None).
+        assert_eq!(
+            resolve_parallel_frame_count(Some(usize::MAX), Some(100)),
+            Some(100)
+        );
+        assert_eq!(resolve_parallel_frame_count(Some(usize::MAX), None), None);
+        // A real limit is clamped by a smaller known length, else kept as-is.
+        assert_eq!(resolve_parallel_frame_count(Some(500), Some(100)), Some(100));
+        assert_eq!(resolve_parallel_frame_count(Some(40), Some(100)), Some(40));
+        assert_eq!(resolve_parallel_frame_count(Some(40), None), Some(40));
+        // No limit: use the known length, or fall back when neither is known.
+        assert_eq!(resolve_parallel_frame_count(None, Some(100)), Some(100));
+        assert_eq!(resolve_parallel_frame_count(None, None), None);
+    }
+
+    #[test]
+    fn parallel_chunk_starts_no_overflow_on_sentinel_count() {
+        // `idx * frame_count` overflowed (debug panic / release garbage) for a
+        // near-`usize::MAX` count before the u128 widening (C7).
+        for &workers in &[2usize, 3, 7, 8, 64] {
+            let starts = parallel_chunk_starts(usize::MAX, workers);
+            assert_eq!(starts.first().copied(), Some(0));
+            assert!(starts.windows(2).all(|w| w[0] < w[1]));
+            assert!(starts.len() <= workers + 1);
+        }
+    }
+
+    #[test]
+    fn parallel_chunk_starts_matches_naive_formula_for_normal_inputs() {
+        // The u128 widening must be byte-identical to the original
+        // `idx * frame_count / workers` for every non-overflowing input.
+        for frame_count in 0usize..512 {
+            for workers in 0usize..9 {
+                let expected: Vec<usize> = if workers <= 1 || frame_count == 0 {
+                    vec![0]
+                } else {
+                    let mut starts: Vec<usize> =
+                        (0..workers).map(|idx| idx * frame_count / workers).collect();
+                    starts.dedup();
+                    if starts.first().copied() != Some(0) {
+                        starts.insert(0, 0);
+                    }
+                    starts
+                };
+                assert_eq!(parallel_chunk_starts(frame_count, workers), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn reconcile_caps_progress_bitmap_for_sentinel_limit() {
+        // `vec![false; frame_limit]` aborted on a `usize::MAX` limit before the
+        // cap (C7). With no messages the channel closes immediately and reconcile
+        // returns the "ended before complete" error — the point is that it must
+        // allocate (capped) and return, not abort/OOM.
+        let (tx, rx) = channel();
+        drop(tx);
+        let chunk_starts = vec![0usize, 1];
+        let stop_after = vec![
+            Arc::new(AtomicUsize::new(usize::MAX)),
+            Arc::new(AtomicUsize::new(usize::MAX)),
+        ];
+        let result = reconcile_parallel_workers(
+            rx,
+            standard_options(),
+            &chunk_starts,
+            usize::MAX,
+            &stop_after,
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parallel_sentinel_frame_limit_matches_sequential() {
+        // `Some(usize::MAX)` is a valid "no limit" sentinel; it must not overflow
+        // or over-allocate, and must reproduce the serial result (C7). On the y4m
+        // fixture (`total_frames == None`) this resolves to the serial fallback.
+        let mut sequential_decoder = decoder();
+        let mut parallel_decoder = decoder();
+        let options = standard_options();
+        let sequential = detect_scene_changes::<u8>(&mut sequential_decoder, options, None, None)
+            .expect("sequential detection should work");
+        let parallel = detect_scene_changes_parallel::<u8>(
+            &mut parallel_decoder,
+            options,
+            Some(usize::MAX),
+            ParallelDetectionOptions { workers: 3 },
+            None,
+        )
+        .expect("parallel detection should work");
+
+        assert_eq!(parallel.scene_changes, sequential.scene_changes);
+        assert_eq!(parallel.scores, sequential.scores);
+        assert_eq!(parallel.frame_count, sequential.frame_count);
+    }
+
+    #[test]
+    fn streamed_reader_buffer_budget_scales_with_active_workers() {
+        // P1: the streamed resident-range budget is one per-worker window times
+        // the number of active workers (>=1), saturating. Scaling by the active
+        // count is what lets the forward-only reader decode far enough ahead to
+        // feed later chunk workers instead of stalling one window past worker 0.
+        assert_eq!(parallel_streamed_reader_buffer_frames(123, 0), 123);
+        assert_eq!(parallel_streamed_reader_buffer_frames(123, 1), 123);
+        assert_eq!(parallel_streamed_reader_buffer_frames(123, 4), 492);
+        assert_eq!(
+            parallel_streamed_reader_buffer_frames(usize::MAX / 2 + 1, 2),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn parallel_active_needed_window_reports_min_and_active_count() {
+        // Underpins both the prune floor (`keep_from`) and the active-worker
+        // budget multiplier (P1). Retired workers (`usize::MAX`) are excluded from
+        // both the min and the count.
+        let all_retired = [
+            Arc::new(AtomicUsize::new(usize::MAX)),
+            Arc::new(AtomicUsize::new(usize::MAX)),
+        ];
+        assert_eq!(parallel_active_needed_window(&all_retired), None);
+        assert_eq!(minimum_parallel_needed_frame(&all_retired), None);
+
+        let mixed = [
+            Arc::new(AtomicUsize::new(usize::MAX)), // retired worker 0
+            Arc::new(AtomicUsize::new(500)),
+            Arc::new(AtomicUsize::new(100)),
+            Arc::new(AtomicUsize::new(usize::MAX)), // retired worker 3
+        ];
+        assert_eq!(parallel_active_needed_window(&mixed), Some((100, 2)));
+        // `minimum_parallel_needed_frame` must still return just the floor so the
+        // existing prune callers are unchanged.
+        assert_eq!(minimum_parallel_needed_frame(&mixed), Some(100));
+    }
+
+    #[test]
+    fn parallel_reader_buffer_frames_uses_byte_budget_not_old_512_cap() {
+        // P1: after the P2/P3 store reduction a frame is small, so the old hard
+        // 512-frame cap truncated the byte budget badly (here several thousand
+        // frames fit in 384 MiB at 240p luma-only, yet only 512 were allowed). The
+        // per-worker window must now follow the byte budget, capped only by the
+        // much larger sanity backstop.
+        let video_details = *decoder().get_video_details();
+        let opts = standard_options();
+        let reducer = parallel_frame_reducer::<u8>(opts, &video_details);
+        let per_worker = parallel_reader_buffer_frames::<u8>(opts, &video_details, &reducer);
+
+        assert!(
+            per_worker > 512,
+            "per-worker budget {per_worker} should exceed the retired 512-frame cap"
+        );
+        assert!(per_worker <= PARALLEL_READER_MAX_BUFFER_FRAMES);
+        // It tracks the byte budget: equals `384 MiB / per-frame cost` here, since
+        // that dominates both the per-worker minimum and the 16k backstop.
+        let frame_bytes = estimated_frame_bytes(&video_details, &reducer)
+            .saturating_add(PARALLEL_READER_FRAME_ENTRY_OVERHEAD_BYTES)
+            .max(1);
+        assert_eq!(per_worker, PARALLEL_READER_TARGET_BUFFER_BYTES / frame_bytes);
     }
 
     #[test]
