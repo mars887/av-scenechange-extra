@@ -37,8 +37,32 @@ pub(crate) const FRAME_LUMA_SIGNATURE_CELLS: usize = 32;
 const FRAME_LUMA_SIGNATURE_COLS: usize = 8;
 const FRAME_LUMA_SIGNATURE_ROWS: usize = 4;
 const FRAME_LUMA_SIGNATURE_SAMPLES_PER_CELL: usize = 4;
-const TOP_BLOCK_MASK_CACHE_INLINE_CAPACITY: usize = 3;
+// Worst case across aggregations: 3 distinct percents x 2 mask kinds — the
+// global `(1,1,false)` masks (feed `global_imp_block_cost`) plus the spatially
+// capped `(region,region,true)` masks (feed `imp_block_cost`) — deduped by the
+// cache. `high_quality` keeps 4 distinct masks (percents 0.10/0.15 x 2 kinds);
+// sizing the inline buffer to 6 keeps every entry's mask set on the stack so the
+// front-insert/back-pop deque churn never spills a `TopBlockMaskCache` to the heap.
+const TOP_BLOCK_MASK_CACHE_INLINE_CAPACITY: usize = 6;
 const FORWARD_REFERENCE_INLINE_CAPACITY: usize = 8;
+
+// Forward-similarity block-sum prefilter (P4 / Variant D). The signature samples
+// exactly the lattice that `masked_luma_delta_8bit` reads (`SAMPLE_STEP` inside
+// full `BLOCK_SIZE`x`BLOCK_SIZE` blocks) but stores it as four 16x16 sub-area
+// integer sums per block, so a triangle-inequality lower bound on each block's
+// masked-luma delta can be assembled without re-reading any planes.
+const FORWARD_PREFILTER_BLOCK_SIZE: usize = 32;
+const FORWARD_PREFILTER_SAMPLE_STEP: usize = 4;
+const FORWARD_PREFILTER_SUBAREA_SIZE: usize = 16;
+const FORWARD_PREFILTER_SUBAREAS: usize = 4;
+/// Number of sampled points per block (`(BLOCK_SIZE / SAMPLE_STEP)^2`), the
+/// divisor `masked_luma_delta_8bit` uses for a full block.
+const FORWARD_PREFILTER_SAMPLES_PER_BLOCK: f64 = 64.0;
+/// Conservative slack subtracted before rejecting on the prefilter bound, so f64
+/// accumulation rounding can never turn a real `bound <= threshold` into a reject
+/// (the bound is a strict lower bound by construction; this only guards float
+/// arithmetic and dwarfs the worst-case accumulation error).
+const FORWARD_PREFILTER_ROUNDING_GUARD_8BIT: f64 = 1e-6;
 
 #[cfg(feature = "bench-internals")]
 pub use self::{
@@ -221,6 +245,14 @@ pub(crate) struct ScenecutAnalysis {
     pub importance_cols: usize,
     pub importance_rows: usize,
     top_block_masks: SmallVec<[TopBlockMaskCache; TOP_BLOCK_MASK_CACHE_INLINE_CAPACITY]>,
+    /// P5 memo: the `(previous_present, next_present)` neighbour shape this entry
+    /// last refreshed against. Its importance scores depend only on the (frozen
+    /// after construction) importance blocks of itself and its present
+    /// previous/next deque neighbours, and the deque is only ever front-inserted
+    /// / back-popped — so an unchanged shape means an unchanged score and
+    /// `refresh_importance_metrics` can skip the recompute. `None` until first
+    /// refresh; `Mean` keeps it `(false, false)` (computed once, then skipped).
+    importance_neighbor_state: Option<(bool, bool)>,
 }
 
 impl ScenecutAnalysis {
@@ -232,6 +264,7 @@ impl ScenecutAnalysis {
             importance_cols: 0,
             importance_rows: 0,
             top_block_masks: SmallVec::new(),
+            importance_neighbor_state: None,
         }
     }
 
@@ -350,12 +383,25 @@ pub struct SceneChangeDetector<T: Pixel> {
     forward_suppress_until: Option<usize>,
     /// Reused per-block deltas for masked forward/transient similarity.
     similarity_block_deltas: Vec<f64>,
+    /// Per-search block-sum signatures of the forward-similarity reference window
+    /// (Variant D prefilter); rebuilt once at the start of each search.
+    forward_ref_signatures: Vec<ForwardPrefilterSignature>,
+    /// Per-search lazily-built block-sum signatures of the forward `frame_set`,
+    /// indexed by `frame_set` position so overlapping offsets reuse them.
+    forward_post_signatures: Vec<Option<ForwardPrefilterSignature>>,
+    /// Reused per-block triangle lower bounds for the Variant D prefilter.
+    prefilter_block_bounds: Vec<f64>,
     /// Reused mask for spatially capped volatile blocks.
     similarity_block_mask: Vec<bool>,
     /// Reused block indices for spatially capped volatile-block selection.
     similarity_block_indices: Vec<usize>,
     /// Reused per-region masked block counts.
     similarity_region_counts: Vec<usize>,
+    /// Reused `selected` scratch for the temporal top-block scorers (P5), so
+    /// `refresh_importance_metrics` stops allocating `vec![false; block_count]`
+    /// per call. Length-stable across a run (every entry has the same block
+    /// count); detached via `mem::take` while scoring, then restored.
+    importance_selected_scratch: Vec<bool>,
     /// Temporary buffer used by `estimate_intra_costs`.
     /// We store it on the struct so we only need to allocate it once.
     temp_plane: Option<Plane<T>>,
@@ -426,9 +472,13 @@ impl<T: Pixel> SceneChangeDetector<T> {
             score_deque,
             forward_suppress_until: None,
             similarity_block_deltas: Vec::new(),
+            forward_ref_signatures: Vec::new(),
+            forward_post_signatures: Vec::new(),
+            prefilter_block_bounds: Vec::new(),
             similarity_block_mask: Vec::new(),
             similarity_block_indices: Vec::new(),
             similarity_region_counts: Vec::new(),
+            importance_selected_scratch: Vec::new(),
             scaled_pixels: pixels,
             bit_depth,
             frame_rate,
@@ -695,9 +745,21 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 region_cols,
                 region_rows,
             } => {
+                // Cache exactly the masks the two readers in
+                // `refresh_importance_metrics` look up. The spatially capped
+                // `(region,region,true)` masks feed `imp_block_cost`
+                // (`temporal_top_importance_score_spatially_capped`); the
+                // `(1,1,false)` masks feed `global_imp_block_cost`
+                // (`temporal_top_importance_score`). Caching both at insertion (P5)
+                // makes the per-frame refresh pure cached-scan + average, so it
+                // never re-sorts the 32k-block index vector on either path. Keep
+                // these two lists in lockstep with those lookups.
                 analysis.cache_top_block_mask(previous_percent, region_cols, region_rows, true);
                 analysis.cache_top_block_mask(current_percent, region_cols, region_rows, true);
                 analysis.cache_top_block_mask(next_percent, region_cols, region_rows, true);
+                analysis.cache_top_block_mask(previous_percent, 1, 1, false);
+                analysis.cache_top_block_mask(current_percent, 1, 1, false);
+                analysis.cache_top_block_mask(next_percent, 1, 1, false);
             }
         }
     }
@@ -908,6 +970,34 @@ impl<T: Pixel> SceneChangeDetector<T> {
         let Some(analysis) = self.score_deque.get(index) else {
             return;
         };
+        // P5: an entry's importance scores read only its own (frozen) importance
+        // blocks plus those of its present previous/next neighbours, so they can
+        // change only when a neighbour appears or disappears. Skip the recompute
+        // (and its sorts/allocations) when the neighbour shape is unchanged since
+        // the last refresh. Keying inside this method — rather than narrowing the
+        // caller's `0..len` loop — keeps the skip valid for any future deque
+        // maintenance, because it observes the real inputs. `Mean` does not vary
+        // with neighbours, so it collapses to `(false, false)`: computed once,
+        // then skipped.
+        let is_temporal = matches!(
+            self.tuning.importance_aggregation,
+            ImportanceAggregation::TemporalTopBlocks { .. }
+                | ImportanceAggregation::SpatialTemporalTopBlocks { .. }
+        );
+        let neighbor_state = (
+            is_temporal && index + 1 < self.score_deque.len(),
+            is_temporal && index > 0,
+        );
+        if analysis.importance_neighbor_state == Some(neighbor_state) {
+            return;
+        }
+        let raw = analysis.result.imp_block_cost_raw;
+        let avg_luma_8bit = analysis.result.avg_luma_8bit;
+
+        // Detach the shared `selected` scratch so the `&self` scorers can reuse
+        // its allocation across frames instead of a per-call `vec![false; n]`.
+        // No early return runs between here and the restore below.
+        let mut selected_scratch = std::mem::take(&mut self.importance_selected_scratch);
         let global_imp_block_cost = match self.tuning.importance_aggregation {
             ImportanceAggregation::TemporalTopBlocks {
                 previous_percent,
@@ -921,28 +1011,30 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 ..
             } => self
                 .temporal_top_importance_score(
+                    &mut selected_scratch,
                     index,
                     previous_percent,
                     current_percent,
                     next_percent,
                 )
-                .unwrap_or(analysis.result.imp_block_cost_raw),
-            ImportanceAggregation::Mean => analysis.result.imp_block_cost_raw,
+                .unwrap_or(raw),
+            ImportanceAggregation::Mean => raw,
         };
         let imp_block_cost = match self.tuning.importance_aggregation {
-            ImportanceAggregation::Mean => analysis.result.imp_block_cost_raw,
+            ImportanceAggregation::Mean => raw,
             ImportanceAggregation::TemporalTopBlocks {
                 previous_percent,
                 current_percent,
                 next_percent,
             } => self
                 .temporal_top_importance_score(
+                    &mut selected_scratch,
                     index,
                     previous_percent,
                     current_percent,
                     next_percent,
                 )
-                .unwrap_or(analysis.result.imp_block_cost_raw),
+                .unwrap_or(raw),
             ImportanceAggregation::SpatialTemporalTopBlocks {
                 previous_percent,
                 current_percent,
@@ -951,6 +1043,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 region_rows,
             } => self
                 .temporal_top_importance_score_spatially_capped(
+                    &mut selected_scratch,
                     index,
                     previous_percent,
                     current_percent,
@@ -958,15 +1051,16 @@ impl<T: Pixel> SceneChangeDetector<T> {
                     region_cols,
                     region_rows,
                 )
-                .unwrap_or(analysis.result.imp_block_cost_raw),
+                .unwrap_or(raw),
         };
-        let avg_luma_8bit = analysis.result.avg_luma_8bit;
+        self.importance_selected_scratch = selected_scratch;
         let threshold = self.importance_threshold(avg_luma_8bit);
         if let Some(analysis) = self.score_deque.get_mut(index) {
             analysis.result.imp_block_cost = imp_block_cost;
             analysis.result.global_imp_block_cost = global_imp_block_cost;
             analysis.result.imp_block_threshold = threshold;
             analysis.result.refresh_ratios();
+            analysis.importance_neighbor_state = Some(neighbor_state);
         }
     }
 
@@ -982,6 +1076,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
 
     fn temporal_top_importance_score(
         &self,
+        selected_buf: &mut Vec<bool>,
         index: usize,
         previous_percent: f64,
         current_percent: f64,
@@ -993,26 +1088,28 @@ impl<T: Pixel> SceneChangeDetector<T> {
             return None;
         }
 
-        let mut selected = vec![false; block_count];
+        selected_buf.clear();
+        selected_buf.resize(block_count, false);
+        let selected = selected_buf.as_mut_slice();
         if let Some(previous) = self.score_deque.get(index + 1) {
             if let Some(mask) = previous.cached_top_block_mask(previous_percent, 1, 1, false) {
-                mark_cached_top_blocks(mask, &mut selected);
+                mark_cached_top_blocks(mask, selected);
             } else {
-                mark_top_blocks(&previous.importance_blocks, previous_percent, &mut selected);
+                mark_top_blocks(&previous.importance_blocks, previous_percent, selected);
             }
         }
         if let Some(mask) = current.cached_top_block_mask(current_percent, 1, 1, false) {
-            mark_cached_top_blocks(mask, &mut selected);
+            mark_cached_top_blocks(mask, selected);
         } else {
-            mark_top_blocks(&current.importance_blocks, current_percent, &mut selected);
+            mark_top_blocks(&current.importance_blocks, current_percent, selected);
         }
         if index > 0
             && let Some(next) = self.score_deque.get(index - 1)
         {
             if let Some(mask) = next.cached_top_block_mask(next_percent, 1, 1, false) {
-                mark_cached_top_blocks(mask, &mut selected);
+                mark_cached_top_blocks(mask, selected);
             } else {
-                mark_top_blocks(&next.importance_blocks, next_percent, &mut selected);
+                mark_top_blocks(&next.importance_blocks, next_percent, selected);
             }
         }
 
@@ -1028,8 +1125,10 @@ impl<T: Pixel> SceneChangeDetector<T> {
         (selected_count > 0).then_some(total / selected_count as f64)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn temporal_top_importance_score_spatially_capped(
         &self,
+        selected_buf: &mut Vec<bool>,
         index: usize,
         previous_percent: f64,
         current_percent: f64,
@@ -1043,12 +1142,14 @@ impl<T: Pixel> SceneChangeDetector<T> {
             return None;
         }
 
-        let mut selected = vec![false; block_count];
+        selected_buf.clear();
+        selected_buf.resize(block_count, false);
+        let selected = selected_buf.as_mut_slice();
         if let Some(previous) = self.score_deque.get(index + 1) {
             if let Some(mask) =
                 previous.cached_top_block_mask(previous_percent, region_cols, region_rows, true)
             {
-                mark_cached_top_blocks(mask, &mut selected);
+                mark_cached_top_blocks(mask, selected);
             } else {
                 mark_top_blocks_spatially_capped(
                     &previous.importance_blocks,
@@ -1057,14 +1158,14 @@ impl<T: Pixel> SceneChangeDetector<T> {
                     current.importance_rows,
                     region_cols,
                     region_rows,
-                    &mut selected,
+                    selected,
                 );
             }
         }
         if let Some(mask) =
             current.cached_top_block_mask(current_percent, region_cols, region_rows, true)
         {
-            mark_cached_top_blocks(mask, &mut selected);
+            mark_cached_top_blocks(mask, selected);
         } else {
             mark_top_blocks_spatially_capped(
                 &current.importance_blocks,
@@ -1073,7 +1174,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 current.importance_rows,
                 region_cols,
                 region_rows,
-                &mut selected,
+                selected,
             );
         }
         if index > 0
@@ -1082,7 +1183,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
             if let Some(mask) =
                 next.cached_top_block_mask(next_percent, region_cols, region_rows, true)
             {
-                mark_cached_top_blocks(mask, &mut selected);
+                mark_cached_top_blocks(mask, selected);
             } else {
                 mark_top_blocks_spatially_capped(
                     &next.importance_blocks,
@@ -1091,7 +1192,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
                     current.importance_rows,
                     region_cols,
                     region_rows,
-                    &mut selected,
+                    selected,
                 );
             }
         }
@@ -1177,6 +1278,28 @@ impl<T: Pixel> SceneChangeDetector<T> {
             .min(frame_set.len().saturating_sub(1));
         let min_offset = min_offset.max(2);
         let threshold_8bit = forward_similarity_threshold_8bit(options, score);
+        // A segment delta may only be reported as a non-exact luma lower bound
+        // strictly above this; at or below it the exact masked-luma+chroma value
+        // is returned so every downstream `candidate.delta <= K` consumer sees the
+        // exact value (effective forward threshold or the option-independent
+        // text-card/dark-occlusion auxiliaries, whichever is larger).
+        let confirmation_threshold =
+            threshold_8bit.max(crate::FORWARD_SIMILARITY_AUXILIARY_MAX_THRESHOLD_8BIT);
+
+        // Variant D prefilter: build the reference-window block-sum signatures once
+        // for this search and reset the lazily-filled post-frame cache. Only when
+        // masking is active (the signatures represent the masked-luma lattice).
+        self.forward_ref_signatures.clear();
+        self.forward_post_signatures.clear();
+        if options.mask_percent > 0.0 {
+            for frame in reference_window.iter().copied() {
+                self.forward_ref_signatures
+                    .push(build_forward_prefilter_signature(frame));
+            }
+            self.forward_post_signatures
+                .resize_with(frame_set.len(), || None);
+        }
+
         let mut candidates = [None; FORWARD_SIMILARITY_DIAGNOSTIC_SLOTS];
         let mut accepted = None;
         let mut rejected_candidates = 0usize;
@@ -1199,6 +1322,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 post_start_offset,
                 offset,
                 options,
+                confirmation_threshold,
             );
             let allow_flash_return = require_return_candidate
                 && return_candidate.is_none()
@@ -1278,6 +1402,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
         post_start_offset: usize,
         post_end_offset: usize,
         options: ForwardSimilarityOptions,
+        confirmation_threshold: f64,
     ) -> f64 {
         let comparison_frames = reference_window
             .len()
@@ -1287,28 +1412,145 @@ impl<T: Pixel> SceneChangeDetector<T> {
         }
 
         let reference_start = reference_window.len() - comparison_frames;
-        let mut lower_bound = 0.0;
-        for idx in 0..comparison_frames {
-            lower_bound += self.frame_similarity_lower_bound_8bit(
-                reference_window[reference_start + idx],
-                frame_set[post_start_offset + idx],
-                options,
-            );
-        }
-        lower_bound /= comparison_frames as f64;
-        if options.mask_percent <= 0.0 || lower_bound > options.threshold_8bit {
-            return lower_bound;
+
+        // Stage 0 — cached block-sum prefilter (P4 / Variant D). When masking is
+        // active and signatures were built for this search, assemble a strict
+        // lower bound on the masked-luma metric from the cached per-frame block-sum
+        // signatures (no full-plane reads, and post frames are sampled once and
+        // reused across overlapping offsets). If even that bound clears the
+        // confirmation threshold the exact metric does too, so report the bound and
+        // skip every plane read. The rounding guard keeps a true `<=` from being
+        // rejected by f64 accumulation error.
+        if options.mask_percent > 0.0
+            && !self.forward_ref_signatures.is_empty()
+            && let Some(bound) = self.forward_segment_prefilter_bound(
+                frame_set,
+                post_start_offset,
+                reference_start,
+                comparison_frames,
+                options.mask_percent,
+            )
+            && bound - FORWARD_PREFILTER_ROUNDING_GUARD_8BIT > confirmation_threshold
+        {
+            return bound;
         }
 
+        // Stage 1 — exact final luma (P4 / Variant C). Compute the luma metric the
+        // segment delta is actually built from (the masked 1/16-lattice metric, or
+        // the full-res SAD when masking is off) and cache each per-frame value.
+        // This replaces the former full-res luma SAD fed through
+        // `masked_delta_lower_bound_8bit`: that analytic bound was derived from the
+        // all-pixel SAD, but the refined metric only samples a 1/16 lattice over
+        // full 32x32 blocks, so it was NOT a valid lower bound on the metric and
+        // could reject pairs the exact metric accepts.
+        let mut luma_deltas =
+            SmallVec::<[f64; FORWARD_REFERENCE_INLINE_CAPACITY]>::with_capacity(comparison_frames);
+        let mut luma_mean = 0.0;
+        for idx in 0..comparison_frames {
+            let frame1 = reference_window[reference_start + idx];
+            let frame2 = frame_set[post_start_offset + idx];
+            let luma_delta = if options.mask_percent > 0.0 {
+                self.masked_luma_delta_8bit(
+                    frame1,
+                    frame2,
+                    options.mask_percent,
+                    options.mask_region_cols,
+                    options.mask_region_rows,
+                )
+            } else {
+                self.luma_delta_8bit(frame1, frame2)
+            };
+            luma_deltas.push(luma_delta);
+            luma_mean += luma_delta;
+        }
+        luma_mean /= comparison_frames as f64;
+
+        // Weighted chroma is non-negative, so the luma mean is a strict lower bound
+        // on the final segment delta. If it already exceeds every threshold that
+        // can act on this candidate, the exact delta does too: skip both full-res
+        // chroma plane SADs and report the luma mean (a value strictly above
+        // `confirmation_threshold`, hence inert to every `delta <= K` consumer).
+        if luma_mean > confirmation_threshold {
+            return luma_mean;
+        }
+
+        // Stage 2 — luma survivors get the exact chroma term, computed once per
+        // pair (not twice as before) and combined in frame order with the cached
+        // luma delta, so the surviving (consumable) delta is the exact metric.
         let mut delta = 0.0;
         for idx in 0..comparison_frames {
-            delta += self.frame_similarity_delta_8bit(
-                reference_window[reference_start + idx],
-                frame_set[post_start_offset + idx],
-                options,
-            );
+            let frame1 = reference_window[reference_start + idx];
+            let frame2 = frame_set[post_start_offset + idx];
+            let weighted_chroma =
+                self.weighted_chroma_delta_8bit(frame1, frame2, options.chroma_weight);
+            delta += luma_deltas[idx] + weighted_chroma;
         }
         delta / comparison_frames as f64
+    }
+
+    /// Strict lower bound on the segment's masked-luma metric assembled from the
+    /// cached block-sum signatures (Variant D), or `None` when any pair has no full
+    /// block grid in common (the exact path then handles it). The bound is `<=` the
+    /// exact masked-luma mean of every pair: each block's bound is a sub-area
+    /// triangle-inequality lower bound on that block's sampled delta, and keeping
+    /// the smallest `keep` of them is the minimum-sum subset of its size, so it
+    /// bounds both the simple and spatially-capped exact masked means.
+    fn forward_segment_prefilter_bound(
+        &mut self,
+        frame_set: &[&Arc<Frame<T>>],
+        post_start_offset: usize,
+        reference_start: usize,
+        comparison_frames: usize,
+        mask_percent: f64,
+    ) -> Option<f64> {
+        // Build any post-frame signatures not cached yet for this search.
+        for idx in 0..comparison_frames {
+            let post_index = post_start_offset + idx;
+            if self.forward_post_signatures[post_index].is_none() {
+                self.forward_post_signatures[post_index] =
+                    Some(build_forward_prefilter_signature(frame_set[post_index]));
+            }
+        }
+
+        let scale = sample_range_scale(self.bit_depth);
+        let clamped = mask_percent.clamp(0.0, 0.95);
+        let mut segment_bound = 0.0;
+        for idx in 0..comparison_frames {
+            let ref_sig = &self.forward_ref_signatures[reference_start + idx];
+            let post_sig = self.forward_post_signatures[post_start_offset + idx]
+                .as_ref()
+                .expect("post signature built above");
+            let cols = ref_sig.cols.min(post_sig.cols);
+            let rows = ref_sig.rows.min(post_sig.rows);
+            if cols == 0 || rows == 0 {
+                return None;
+            }
+            let block_count = cols * rows;
+            // Keep the same block count the exact masking retains (it removes
+            // `ceil(n*mask)` blocks, clamped to keep >= 1); valid for both the
+            // simple and spatially-capped paths.
+            let target_mask =
+                ((block_count as f64 * clamped).ceil() as usize).min(block_count - 1);
+            let keep = block_count - target_mask;
+
+            self.prefilter_block_bounds.clear();
+            self.prefilter_block_bounds.reserve(block_count);
+            for by in 0..rows {
+                for bx in 0..cols {
+                    let reference = ref_sig.sub_sums[by * ref_sig.cols + bx];
+                    let post = post_sig.sub_sums[by * post_sig.cols + bx];
+                    let mut numerator = 0u32;
+                    for sub in 0..FORWARD_PREFILTER_SUBAREAS {
+                        numerator += reference[sub].abs_diff(post[sub]);
+                    }
+                    self.prefilter_block_bounds
+                        .push(f64::from(numerator) / FORWARD_PREFILTER_SAMPLES_PER_BLOCK / scale);
+                }
+            }
+            segment_bound += forward_prefilter_masked_mean(&mut self.prefilter_block_bounds, keep);
+        }
+
+        Some(segment_bound / comparison_frames as f64)
     }
 
     fn forward_return_candidate(
@@ -1378,37 +1620,6 @@ impl<T: Pixel> SceneChangeDetector<T> {
         } = self.tuning.transient_similarity;
         let darkness = smoothstep_darkness(avg_luma_8bit, dark_luma_low_8bit, dark_luma_high_8bit);
         threshold_8bit + (dark_threshold_8bit - threshold_8bit) * darkness
-    }
-
-    fn frame_similarity_lower_bound_8bit(
-        &self,
-        frame1: &Arc<Frame<T>>,
-        frame2: &Arc<Frame<T>>,
-        options: ForwardSimilarityOptions,
-    ) -> f64 {
-        let luma_delta = self.luma_delta_8bit(frame1, frame2);
-        let luma_lower_bound = masked_delta_lower_bound_8bit(luma_delta, options.mask_percent);
-        luma_lower_bound + self.weighted_chroma_delta_8bit(frame1, frame2, options.chroma_weight)
-    }
-
-    fn frame_similarity_delta_8bit(
-        &mut self,
-        frame1: &Arc<Frame<T>>,
-        frame2: &Arc<Frame<T>>,
-        options: ForwardSimilarityOptions,
-    ) -> f64 {
-        let luma_delta = if options.mask_percent > 0.0 {
-            self.masked_luma_delta_8bit(
-                frame1,
-                frame2,
-                options.mask_percent,
-                options.mask_region_cols,
-                options.mask_region_rows,
-            )
-        } else {
-            self.luma_delta_8bit(frame1, frame2)
-        };
-        luma_delta + self.weighted_chroma_delta_8bit(frame1, frame2, options.chroma_weight)
     }
 
     fn weighted_chroma_delta_8bit(
@@ -1721,13 +1932,82 @@ fn sample_range_scale(bit_depth: usize) -> f64 {
     (2.0_f64.powi(bit_depth as i32) - 1.0) / 255.0
 }
 
-fn masked_delta_lower_bound_8bit(delta_8bit: f64, mask_percent: f64) -> f64 {
-    let mask_percent = mask_percent.clamp(0.0, 0.95);
-    if mask_percent == 0.0 {
-        return delta_8bit;
+/// Block-sum signature backing the Variant D forward-similarity prefilter.
+///
+/// For every full `FORWARD_PREFILTER_BLOCK_SIZE` block of a frame's luma plane it
+/// stores the raw integer sums of the sampled lattice points (`SAMPLE_STEP`) in
+/// each of the four `FORWARD_PREFILTER_SUBAREA_SIZE` quadrants. The sums are
+/// bit-depth independent; the sample-range scale is applied when the bound is
+/// formed. `cols`/`rows` are this frame's own full-block grid, so a pair compares
+/// only the common `min(cols)` x `min(rows)` sub-grid.
+struct ForwardPrefilterSignature {
+    cols: usize,
+    rows: usize,
+    sub_sums: Vec<[u32; FORWARD_PREFILTER_SUBAREAS]>,
+}
+
+fn build_forward_prefilter_signature<T: Pixel>(frame: &Frame<T>) -> ForwardPrefilterSignature {
+    let plane = &frame.y_plane;
+    let cols = plane.width().get() / FORWARD_PREFILTER_BLOCK_SIZE;
+    let rows = plane.height().get() / FORWARD_PREFILTER_BLOCK_SIZE;
+    let mut sub_sums = Vec::with_capacity(cols * rows);
+    if cols == 0 || rows == 0 {
+        return ForwardPrefilterSignature {
+            cols,
+            rows,
+            sub_sums,
+        };
     }
 
-    ((delta_8bit - mask_percent * 255.0) / (1.0 - mask_percent)).max(0.0)
+    let stride = plane.geometry().stride.get();
+    let origin = plane.data_origin();
+    let data = plane.data();
+    for by in 0..rows {
+        for bx in 0..cols {
+            let y_base = by * FORWARD_PREFILTER_BLOCK_SIZE;
+            let x_base = bx * FORWARD_PREFILTER_BLOCK_SIZE;
+            let mut sums = [0u32; FORWARD_PREFILTER_SUBAREAS];
+            let mut dy = 0;
+            while dy < FORWARD_PREFILTER_BLOCK_SIZE {
+                let quad_y = dy / FORWARD_PREFILTER_SUBAREA_SIZE;
+                let mut dx = 0;
+                while dx < FORWARD_PREFILTER_BLOCK_SIZE {
+                    let quad = quad_y * 2 + dx / FORWARD_PREFILTER_SUBAREA_SIZE;
+                    let pixel = data[origin + (y_base + dy) * stride + (x_base + dx)]
+                        .to_u32()
+                        .expect("pixel value should fit in u32");
+                    sums[quad] += pixel;
+                    dx += FORWARD_PREFILTER_SAMPLE_STEP;
+                }
+                dy += FORWARD_PREFILTER_SAMPLE_STEP;
+            }
+            sub_sums.push(sums);
+        }
+    }
+
+    ForwardPrefilterSignature {
+        cols,
+        rows,
+        sub_sums,
+    }
+}
+
+/// Mean of the smallest `keep` block bounds — the global-masking lower bound that
+/// is `<=` both the simple and spatially-capped exact masked means (the smallest
+/// `keep` form the minimum-sum subset of their size). Partially reorders `bounds`.
+fn forward_prefilter_masked_mean(bounds: &mut [f64], keep: usize) -> f64 {
+    let block_count = bounds.len();
+    if block_count == 0 {
+        return 0.0;
+    }
+    let keep = keep.max(1).min(block_count);
+    if keep == block_count {
+        return bounds.iter().sum::<f64>() / block_count as f64;
+    }
+    bounds.select_nth_unstable_by(keep - 1, |a, b| {
+        a.partial_cmp(b).unwrap_or(cmp::Ordering::Equal)
+    });
+    bounds[..keep].iter().sum::<f64>() / keep as f64
 }
 
 pub(crate) fn frame_luma_signature_8bit<T: Pixel>(
@@ -1845,6 +2125,542 @@ mod tests {
         score.cost_ratio = cost_ratio;
         score.imp_block_ratio = imp_block_ratio;
         score
+    }
+
+    fn forward_test_detector(width: usize, height: usize) -> SceneChangeDetector<u8> {
+        SceneChangeDetector::new(
+            (width, height),
+            8,
+            Rational32::new(30, 1),
+            ChromaSubsampling::Yuv420,
+            5,
+            SceneDetectionSpeed::High,
+            DetectionTuning::default(),
+            0,
+            0,
+        )
+    }
+
+    fn fill_plane_with(plane: &mut Plane<u8>, f: impl Fn(usize, usize) -> u8) {
+        let stride = plane.geometry().stride.get();
+        let width = plane.width().get();
+        let height = plane.height().get();
+        let origin = plane.data_origin();
+        let data = plane.data_mut();
+        for y in 0..height {
+            for x in 0..width {
+                data[origin + y * stride + x] = f(y, x);
+            }
+        }
+    }
+
+    fn yuv420_frame(
+        width: usize,
+        height: usize,
+        luma: impl Fn(usize, usize) -> u8,
+        chroma: impl Fn(usize, usize) -> u8,
+    ) -> Arc<Frame<u8>> {
+        let mut frame = v_frame::frame::FrameBuilder::new(
+            NonZeroUsize::new(width).unwrap(),
+            NonZeroUsize::new(height).unwrap(),
+            ChromaSubsampling::Yuv420,
+            NonZeroU8::new(8).unwrap(),
+        )
+        .build::<u8>()
+        .unwrap();
+        fill_plane_with(&mut frame.y_plane, luma);
+        if let Some(plane) = frame.u_plane.as_mut() {
+            fill_plane_with(plane, &chroma);
+        }
+        if let Some(plane) = frame.v_plane.as_mut() {
+            fill_plane_with(plane, &chroma);
+        }
+        Arc::new(frame)
+    }
+
+    fn forward_test_options() -> ForwardSimilarityOptions {
+        ForwardSimilarityOptions {
+            enabled: true,
+            frames: 80,
+            window_frames: 3,
+            min_offset: 4,
+            threshold_8bit: 6.0,
+            relaxed_threshold_8bit: 8.5,
+            mask_percent: 0.20,
+            mask_region_cols: 8,
+            mask_region_rows: 4,
+            chroma_weight: 0.25,
+            ..ForwardSimilarityOptions::default()
+        }
+    }
+
+    // P5 parity: with the global `(1,1,false)` masks cached (Part A) and the
+    // per-entry neighbour memo (Part B), every deque entry's `imp_block_cost` and
+    // `global_imp_block_cost` must stay bit-identical to a brute-force recompute
+    // that consults neither the mask cache nor the memo. `parallel_high_matches_
+    // sequential` runs the SAME detector code on both sides, so it cannot catch a
+    // logic bug here; this pins the optimized path against an independent reference.
+    #[test]
+    fn high_importance_refresh_matches_bruteforce() {
+        // Recompute one entry's temporal top-block score from scratch — always
+        // sorting (never consulting the cache) and ignoring the memo — mirroring
+        // the production scorers exactly. `capped` selects the spatial path
+        // (imp_block_cost) vs the global path (global_imp_block_cost).
+        fn top_score(
+            deque: &[ScenecutAnalysis],
+            index: usize,
+            capped: bool,
+            previous_percent: f64,
+            current_percent: f64,
+            next_percent: f64,
+            region_cols: usize,
+            region_rows: usize,
+        ) -> Option<f64> {
+            let current = deque.get(index)?;
+            let block_count = current.importance_blocks.len();
+            if block_count == 0 {
+                return None;
+            }
+            if capped && (current.importance_cols == 0 || current.importance_rows == 0) {
+                return None;
+            }
+            let mut selected = vec![false; block_count];
+            let mark = |src: &[f64], percent: f64, sel: &mut [bool]| {
+                if capped {
+                    mark_top_blocks_spatially_capped(
+                        src,
+                        percent,
+                        current.importance_cols,
+                        current.importance_rows,
+                        region_cols,
+                        region_rows,
+                        sel,
+                    );
+                } else {
+                    mark_top_blocks(src, percent, sel);
+                }
+            };
+            if let Some(previous) = deque.get(index + 1) {
+                mark(&previous.importance_blocks, previous_percent, &mut selected);
+            }
+            mark(&current.importance_blocks, current_percent, &mut selected);
+            if index > 0
+                && let Some(next) = deque.get(index - 1)
+            {
+                mark(&next.importance_blocks, next_percent, &mut selected);
+            }
+            let mut total = 0.0;
+            let mut count = 0usize;
+            for (i, &is_selected) in selected.iter().enumerate() {
+                if is_selected {
+                    total += current.importance_blocks[i];
+                    count += 1;
+                }
+            }
+            (count > 0).then_some(total / count as f64)
+        }
+
+        let (previous_percent, current_percent, next_percent) = (0.10_f64, 0.15_f64, 0.10_f64);
+        let (region_cols, region_rows) = (8usize, 4usize);
+        let (w, h) = (256, 128);
+
+        let mut tuning = DetectionTuning::high_quality();
+        tuning.importance_aggregation = ImportanceAggregation::SpatialTemporalTopBlocks {
+            previous_percent,
+            current_percent,
+            next_percent,
+            region_cols,
+            region_rows,
+        };
+        // Drive the deque purely by insert/pop; no forward-similarity frame reads.
+        tuning.forward_similarity.enabled = false;
+
+        let mut det = SceneChangeDetector::<u8>::new(
+            (w, h),
+            8,
+            Rational32::new(30, 1),
+            ChromaSubsampling::Yuv420,
+            5,
+            SceneDetectionSpeed::High,
+            tuning,
+            0,
+            1000,
+        );
+
+        // Varied content so different blocks win the selection on different frames
+        // (otherwise the masks are trivially equal and the test proves nothing).
+        let frames: Vec<Arc<Frame<u8>>> = (0..24)
+            .map(|t| {
+                yuv420_frame(
+                    w,
+                    h,
+                    move |y, x| {
+                        let stripe = (x + y * 2 + t * 7) as u32 % 64;
+                        let patch = if x / 16 == (t * 3) % (w / 16) && y / 16 == t % (h / 16) {
+                            210
+                        } else {
+                            0
+                        };
+                        ((stripe + patch) % 256) as u8
+                    },
+                    |_, _| 128,
+                )
+            })
+            .collect();
+
+        // Mimic the serial driver: window starts at frameno-1 and spans the
+        // lookahead; input_frameno == frameno. Exercises init, warmup, the
+        // steady-state back-pop, and the end-of-video tail (window shrinks).
+        let lookahead = 5usize;
+        let mut saw_divergence = false;
+        for frameno in 1..frames.len() {
+            let start = frameno - 1;
+            let end = (start + lookahead + 2).min(frames.len());
+            let window: Vec<&Arc<Frame<u8>>> = frames[start..end].iter().collect();
+            if window.len() < 2 {
+                break;
+            }
+            det.analyze_next_frame(&window, frameno, 0);
+
+            // The end-of-frame `pop()` runs after `adaptive_scenecut`, so it can
+            // leave the new oldest entry's stored score reflecting the neighbour it
+            // just lost. The detector never consumes that entry until the next
+            // frame's `adaptive_scenecut`, whose top-of-function refresh runs first
+            // (the entry's `(prev_present, ..)` key flipped, forcing a recompute).
+            // Mirror that refresh here so we compare against the values the
+            // algorithm actually reads — and so a wrongly-skipped refresh (which
+            // this pass would also skip, by the same memo key) still surfaces as a
+            // mismatch against the brute-force reference below.
+            for idx in 0..det.score_deque.len() {
+                det.refresh_importance_metrics(idx);
+            }
+
+            for idx in 0..det.score_deque.len() {
+                let raw = det.score_deque[idx].result.imp_block_cost_raw;
+                let want_imp = top_score(
+                    &det.score_deque,
+                    idx,
+                    true,
+                    previous_percent,
+                    current_percent,
+                    next_percent,
+                    region_cols,
+                    region_rows,
+                )
+                .unwrap_or(raw);
+                let want_global = top_score(
+                    &det.score_deque,
+                    idx,
+                    false,
+                    previous_percent,
+                    current_percent,
+                    next_percent,
+                    region_cols,
+                    region_rows,
+                )
+                .unwrap_or(raw);
+
+                let got = det.score_deque[idx].result;
+                assert_eq!(
+                    got.imp_block_cost.to_bits(),
+                    want_imp.to_bits(),
+                    "imp_block_cost mismatch: frameno={frameno} idx={idx}"
+                );
+                assert_eq!(
+                    got.global_imp_block_cost.to_bits(),
+                    want_global.to_bits(),
+                    "global_imp_block_cost mismatch: frameno={frameno} idx={idx}"
+                );
+                if (want_imp - want_global).abs() > 1e-9 {
+                    saw_divergence = true;
+                }
+            }
+        }
+        assert!(
+            saw_divergence,
+            "content too uniform: capped and global scores never diverged"
+        );
+    }
+
+    // The exact masked-luma metric (`masked_luma_delta_8bit`) only samples a 1/16
+    // lattice inside full 32x32 blocks, so a pair can be identical on the lattice
+    // (masked delta 0) while the full-resolution SAD is huge. The removed
+    // `masked_delta_lower_bound_8bit` early-out derived its "lower bound" from that
+    // full SAD and would reject such a pair; Variant C uses the exact masked metric
+    // and must accept it. This also exercises gpt5.5 counterexample #1.
+    #[test]
+    fn forward_segment_uses_exact_masked_metric_not_full_sad() {
+        let (w, h) = (96, 64);
+        let options = forward_test_options();
+        let f1 = yuv420_frame(w, h, |_, _| 0, |_, _| 128);
+        // Lattice points (y%4==0 && x%4==0) stay 0; everything else jumps to 255.
+        let f2 = yuv420_frame(
+            w,
+            h,
+            |y, x| if y % 4 == 0 && x % 4 == 0 { 0 } else { 255 },
+            |_, _| 128,
+        );
+        let mut det = forward_test_detector(w, h);
+        let masked = det.masked_luma_delta_8bit(&f1, &f2, options.mask_percent, 8, 4);
+        let full = det.luma_delta_8bit(&f1, &f2);
+        assert!(masked < 1.0, "masked metric should see a near-identical pair");
+        assert!(full > 200.0, "full SAD should see a very different pair");
+        // The segment delta must follow the masked metric (accept), not the SAD.
+        let got = det.forward_segment_similarity_delta_8bit(&[&f1], &[&f2], 0, 0, options, 8.5);
+        assert!(
+            got < 1.0,
+            "segment delta must track the exact masked metric, got {got}"
+        );
+    }
+
+    // For every offset the reported delta must equal an always-exact reference
+    // (`masked_luma + weighted_chroma`) whenever it is at/below the confirmation
+    // threshold (so every `candidate.delta <= K` consumer sees the exact value),
+    // and must imply the exact value is also above when it is reported above.
+    #[test]
+    fn forward_segment_matches_always_exact_reference() {
+        let (w, h) = (96, 64);
+        let options = forward_test_options();
+        let pairs = [
+            // identical luma + chroma
+            (
+                yuv420_frame(w, h, |_, _| 100, |_, _| 128),
+                yuv420_frame(w, h, |_, _| 100, |_, _| 128),
+            ),
+            // shifted gradient (small-ish luma + chroma change)
+            (
+                yuv420_frame(w, h, |y, x| ((y + x) % 256) as u8, |_, _| 128),
+                yuv420_frame(w, h, |y, x| ((y + x + 30) % 256) as u8, |_, _| 150),
+            ),
+            // lattice-identical luma, huge off-lattice change (masked ~0)
+            (
+                yuv420_frame(w, h, |_, _| 0, |_, _| 128),
+                yuv420_frame(
+                    w,
+                    h,
+                    |y, x| if y % 4 == 0 && x % 4 == 0 { 0 } else { 255 },
+                    |_, _| 128,
+                ),
+            ),
+            // chroma-only difference (identical luma -> luma prefilter must not skip)
+            (
+                yuv420_frame(w, h, |_, _| 80, |_, _| 100),
+                yuv420_frame(w, h, |_, _| 80, |_, _| 200),
+            ),
+            // large luma difference (rejected high above threshold)
+            (
+                yuv420_frame(w, h, |_, _| 10, |_, _| 128),
+                yuv420_frame(w, h, |_, _| 240, |_, _| 128),
+            ),
+        ];
+        for &confirmation in &[6.0_f64, 8.5, 50.0] {
+            for (f1, f2) in &pairs {
+                let mut det = forward_test_detector(w, h);
+                let got = det
+                    .forward_segment_similarity_delta_8bit(&[f1], &[f2], 0, 0, options, confirmation);
+                let exact_luma =
+                    det.masked_luma_delta_8bit(f1, f2, options.mask_percent, 8, 4);
+                let exact_chroma = det.weighted_chroma_delta_8bit(f1, f2, options.chroma_weight);
+                let exact = exact_luma + exact_chroma;
+                if got <= confirmation {
+                    assert_eq!(
+                        got.to_bits(),
+                        exact.to_bits(),
+                        "consumable delta must be bit-exact (conf {confirmation})"
+                    );
+                } else {
+                    assert!(
+                        exact > confirmation,
+                        "a delta reported above {confirmation} must be exactly above it (exact {exact})"
+                    );
+                }
+            }
+        }
+    }
+
+    fn fill_plane_generic<T: Pixel>(plane: &mut Plane<T>, f: &impl Fn(usize, usize) -> i32) {
+        let stride = plane.geometry().stride.get();
+        let width = plane.width().get();
+        let height = plane.height().get();
+        let origin = plane.data_origin();
+        let data = plane.data_mut();
+        for y in 0..height {
+            for x in 0..width {
+                data[origin + y * stride + x] = T::from(f(y, x)).unwrap();
+            }
+        }
+    }
+
+    fn yuv420_frame_generic<T: Pixel>(
+        width: usize,
+        height: usize,
+        bit_depth: u8,
+        luma: impl Fn(usize, usize) -> i32,
+        chroma: impl Fn(usize, usize) -> i32,
+    ) -> Arc<Frame<T>> {
+        let mut frame = v_frame::frame::FrameBuilder::new(
+            NonZeroUsize::new(width).unwrap(),
+            NonZeroUsize::new(height).unwrap(),
+            ChromaSubsampling::Yuv420,
+            NonZeroU8::new(bit_depth).unwrap(),
+        )
+        .build::<T>()
+        .unwrap();
+        fill_plane_generic(&mut frame.y_plane, &luma);
+        if let Some(plane) = frame.u_plane.as_mut() {
+            fill_plane_generic(plane, &chroma);
+        }
+        if let Some(plane) = frame.v_plane.as_mut() {
+            fill_plane_generic(plane, &chroma);
+        }
+        Arc::new(frame)
+    }
+
+    fn forward_test_detector_bits<T: Pixel>(
+        width: usize,
+        height: usize,
+        bit_depth: usize,
+    ) -> SceneChangeDetector<T> {
+        SceneChangeDetector::new(
+            (width, height),
+            bit_depth,
+            Rational32::new(30, 1),
+            ChromaSubsampling::Yuv420,
+            5,
+            SceneDetectionSpeed::High,
+            DetectionTuning::default(),
+            0,
+            0,
+        )
+    }
+
+    // Core Variant D invariant: the cached block-sum bound is never above the exact
+    // masked-luma metric, across bit depths, dimensions, masks, region modes, and
+    // pixel patterns (including sign-cancelling and lattice-aligned ones).
+    fn check_prefilter_lower_bound<T: Pixel>(bit_depth: usize) {
+        let max = (1i32 << bit_depth) - 1;
+        let half = max / 2;
+        let quarter = max / 4;
+        type Pat = Box<dyn Fn(usize, usize) -> i32>;
+        let dims = [(64usize, 64usize), (96, 64), (100, 70)];
+        let masks = [0.01f64, 0.20, 0.95];
+        let regions = [(1usize, 1usize), (8usize, 4usize)];
+        for &(w, h) in &dims {
+            let cases: Vec<(&str, Pat, Pat)> = vec![
+                ("identical", Box::new(move |_, _| half), Box::new(move |_, _| half)),
+                ("uniform_max", Box::new(|_, _| 0), Box::new(move |_, _| max)),
+                (
+                    "gradient",
+                    Box::new(|_, _| 0),
+                    Box::new(move |y, x| (((y + x) as i32) * 7) % (max + 1)),
+                ),
+                (
+                    "checker",
+                    Box::new(|_, _| 0),
+                    Box::new(move |y, x| if (x / 4 + y / 4) % 2 == 0 { 0 } else { max }),
+                ),
+                (
+                    "lattice_identical",
+                    Box::new(|_, _| 0),
+                    Box::new(move |y, x| if y % 4 == 0 && x % 4 == 0 { 0 } else { max }),
+                ),
+                (
+                    "sign_cancel",
+                    Box::new(move |_, _| half),
+                    Box::new(move |y, x| {
+                        if (x / 4 + y / 4) % 2 == 0 {
+                            (half + quarter).min(max)
+                        } else {
+                            (half - quarter).max(0)
+                        }
+                    }),
+                ),
+            ];
+            for (name, f1_fn, f2_fn) in &cases {
+                let f1: Arc<Frame<T>> =
+                    yuv420_frame_generic(w, h, bit_depth as u8, |y, x| f1_fn(y, x), |_, _| half);
+                let f2: Arc<Frame<T>> =
+                    yuv420_frame_generic(w, h, bit_depth as u8, |y, x| f2_fn(y, x), |_, _| half);
+                for &mask in &masks {
+                    for &(rc, rr) in &regions {
+                        let mut det = forward_test_detector_bits::<T>(w, h, bit_depth);
+                        det.forward_ref_signatures
+                            .push(build_forward_prefilter_signature(&f1));
+                        det.forward_post_signatures
+                            .push(Some(build_forward_prefilter_signature(&f2)));
+                        let bound = det
+                            .forward_segment_prefilter_bound(&[&f2], 0, 0, 1, mask)
+                            .expect("full block grid present");
+                        let exact = det.masked_luma_delta_8bit(&f1, &f2, mask, rc, rr);
+                        assert!(
+                            bound <= exact + 1e-9,
+                            "{name} {w}x{h} bd{bit_depth} mask {mask} region {rc}x{rr}: \
+                             bound {bound} exceeded exact {exact}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forward_prefilter_bound_is_below_exact_masked_luma() {
+        check_prefilter_lower_bound::<u8>(8);
+        check_prefilter_lower_bound::<u16>(10);
+    }
+
+    // The prefilter must never alter a consumable (<= confirmation) delta: those
+    // are returned exactly by the exact path whether or not signatures are present.
+    #[test]
+    fn forward_prefilter_preserves_consumable_deltas() {
+        let (w, h) = (96, 64);
+        let options = forward_test_options();
+        let pairs = [
+            (
+                yuv420_frame(w, h, |_, _| 100, |_, _| 128),
+                yuv420_frame(w, h, |_, _| 100, |_, _| 128),
+            ),
+            (
+                yuv420_frame(w, h, |_, _| 80, |_, _| 100),
+                yuv420_frame(w, h, |_, _| 80, |_, _| 200),
+            ),
+            (
+                yuv420_frame(w, h, |_, _| 10, |_, _| 128),
+                yuv420_frame(w, h, |_, _| 240, |_, _| 128),
+            ),
+            (
+                yuv420_frame(w, h, |y, x| ((y + x) % 256) as u8, |_, _| 128),
+                yuv420_frame(w, h, |y, x| ((y + x + 14) % 256) as u8, |_, _| 150),
+            ),
+        ];
+        for &confirmation in &[6.0_f64, 8.5, 50.0] {
+            for (f1, f2) in &pairs {
+                let mut without = forward_test_detector(w, h);
+                let got_without = without
+                    .forward_segment_similarity_delta_8bit(&[f1], &[f2], 0, 0, options, confirmation);
+
+                let mut with = forward_test_detector(w, h);
+                with.forward_ref_signatures
+                    .push(build_forward_prefilter_signature(f1));
+                with.forward_post_signatures
+                    .push(Some(build_forward_prefilter_signature(f2)));
+                let got_with = with
+                    .forward_segment_similarity_delta_8bit(&[f1], &[f2], 0, 0, options, confirmation);
+
+                if got_without <= confirmation {
+                    assert_eq!(
+                        got_without.to_bits(),
+                        got_with.to_bits(),
+                        "prefilter changed a consumable delta (conf {confirmation})"
+                    );
+                } else {
+                    assert!(
+                        got_with > confirmation,
+                        "prefilter reported a consumable value for a rejected pair"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

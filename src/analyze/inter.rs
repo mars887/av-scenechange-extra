@@ -1994,29 +1994,15 @@ mod tests {
             FrameMEStats::new_arc_array(cols, rows),
         );
 
-        let bsize = BlockSize::from_width_and_height(IMPORTANCE_BLOCK_SIZE, IMPORTANCE_BLOCK_SIZE);
-        let mut zero_motion_cost = 0u64;
-        for y in 0..current.y_plane.height().get() / IMPORTANCE_BLOCK_SIZE {
-            for x in 0..current.y_plane.width().get() / IMPORTANCE_BLOCK_SIZE {
-                let region_org = current.y_plane.region(Area::Rect(Rect {
-                    x: (x * IMPORTANCE_BLOCK_SIZE) as isize,
-                    y: (y * IMPORTANCE_BLOCK_SIZE) as isize,
-                    width: IMPORTANCE_BLOCK_SIZE,
-                    height: IMPORTANCE_BLOCK_SIZE,
-                }));
-                let region_ref = reference.y_plane.region(Area::Rect(Rect {
-                    x: (x * IMPORTANCE_BLOCK_SIZE) as isize,
-                    y: (y * IMPORTANCE_BLOCK_SIZE) as isize,
-                    width: IMPORTANCE_BLOCK_SIZE,
-                    height: IMPORTANCE_BLOCK_SIZE,
-                }));
-                zero_motion_cost +=
-                    get_satd(&region_org, &region_ref, bsize.width(), bsize.height(), 8) as u64;
-            }
-        }
-        let block_count = (current.y_plane.width().get() / IMPORTANCE_BLOCK_SIZE)
-            * (current.y_plane.height().get() / IMPORTANCE_BLOCK_SIZE);
-        let zero_motion_mean = zero_motion_cost as f64 / block_count as f64;
+        // Zero-motion baseline: the static (mv=0) SATD scan, taken from the
+        // production estimator rather than re-derived here so the two cannot
+        // drift. This is *not* the function under test -- `estimate_inter_costs_detailed`
+        // runs reference-frame motion estimation, whereas
+        // `estimate_static_inter_costs_detailed` forces zero motion
+        // (`motion_cost_computed = false`, `motion_mean = mean`). The assertions
+        // below check that ME beats this baseline and that the primary scene-cut
+        // `mean` reproduces it exactly.
+        let zero_motion_mean = estimate_static_inter_costs_detailed(&current, &reference, 8).mean;
 
         assert!(
             estimate.motion_mean < zero_motion_mean * 0.75,

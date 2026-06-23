@@ -176,6 +176,7 @@ impl<T: Pixel> SceneChangeDetector<T> {
             importance_cols: imp_block_diff.cols,
             importance_rows: imp_block_diff.rows,
             top_block_masks: Default::default(),
+            importance_neighbor_state: None,
         }
     }
 }

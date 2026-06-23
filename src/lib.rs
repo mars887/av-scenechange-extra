@@ -679,20 +679,7 @@ pub fn detect_scene_changes<T: Pixel>(
     progress_callback: Option<&dyn Fn(usize, usize)>,
 ) -> anyhow::Result<DetectionResults> {
     let effective_lookahead = opts.effective_lookahead_distance();
-    let transient_history = if opts.tuning.transient_similarity.enabled {
-        opts.tuning.transient_similarity.frames
-    } else {
-        0
-    };
-    let forward_similarity_history = if opts.tuning.forward_similarity.enabled {
-        opts.tuning
-            .forward_similarity
-            .window_frames
-            .saturating_sub(1)
-    } else {
-        0
-    };
-    let frame_history = transient_history.max(forward_similarity_history);
+    let frame_history = parallel_frame_history(opts);
     assert!(effective_lookahead >= 1);
 
     let detector = new_detector::<T>(dec, opts)?;
@@ -926,9 +913,8 @@ pub fn detect_scene_changes_parallel<T: Pixel + Send + Sync + 'static>(
                         )
                     }));
                     let message = match result {
-                        Ok(Ok(frame_count)) => ParallelWorkerMessage::Done {
+                        Ok(Ok(_)) => ParallelWorkerMessage::Done {
                             worker,
-                            frame_count,
                             error: None,
                         },
                         Ok(Err(error)) => {
@@ -941,7 +927,6 @@ pub fn detect_scene_changes_parallel<T: Pixel + Send + Sync + 'static>(
                                 .fail(format!("scene detection worker {worker} failed: {error}"));
                             ParallelWorkerMessage::Done {
                                 worker,
-                                frame_count: start_frame,
                                 error: Some(error.to_string()),
                             }
                         }
@@ -957,7 +942,6 @@ pub fn detect_scene_changes_parallel<T: Pixel + Send + Sync + 'static>(
                             ));
                             ParallelWorkerMessage::Done {
                                 worker,
-                                frame_count: start_frame,
                                 error: Some(format!("worker {worker} panicked: {detail}")),
                             }
                         }
@@ -983,6 +967,7 @@ pub fn detect_scene_changes_parallel<T: Pixel + Send + Sync + 'static>(
             )
         });
 
+        #[cfg(feature = "vapoursynth")]
         let read_result = if let Some(frame_request_rx) = frame_request_rx {
             drop(frame_request_tx);
             read_parallel_indexed_frames::<T>(
@@ -1009,6 +994,27 @@ pub fn detect_scene_changes_parallel<T: Pixel + Send + Sync + 'static>(
                 &frame_reducer,
             )
         };
+        // Without VapourSynth no decoder supports indexed reads
+        // (`decoder_supports_indexed_frames` is statically `false`), so
+        // `frame_request_rx` is always `None` and only the streamed reader can
+        // run. Bind it directly to avoid referencing the indexed reader, which is
+        // compiled out in this configuration.
+        #[cfg(not(feature = "vapoursynth"))]
+        let read_result = {
+            debug_assert!(frame_request_rx.is_none());
+            drop(frame_request_tx);
+            drop(frame_request_rx);
+            read_parallel_streamed_frames::<T>(
+                dec,
+                frame_count,
+                &store,
+                &needed_from,
+                per_worker_buffered_frames,
+                &progress_rx,
+                progress_callback,
+                &frame_reducer,
+            )
+        };
         if let Ok(produced) = &read_result {
             store.finish(*produced);
             let _ = reader_tx.send(ParallelWorkerMessage::ReaderDone {
@@ -1018,34 +1024,13 @@ pub fn detect_scene_changes_parallel<T: Pixel + Send + Sync + 'static>(
         drop(reader_tx);
         drain_parallel_progress(&progress_rx, progress_callback);
 
-        let reconcile_result = reconcile_handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("scene detection reconciliation thread panicked"))
-            .and_then(|inner| inner);
-        drain_parallel_progress(&progress_rx, progress_callback);
-
-        // Stop every worker, then ALWAYS join them before returning. Joining a
-        // scoped thread consumes its panic payload, which is what prevents
-        // `thread::scope` from re-throwing a worker panic as an API-level panic
-        // (C4 defect 1). On failure the worker already called `store.fail`, so the
-        // inline reader has already stopped and these joins return promptly.
-        for stop in &stop_after {
-            stop.store(0, Ordering::Release);
-        }
-        let mut worker_panic: Option<anyhow::Error> = None;
-        for handle in worker_handles {
-            if handle.join().is_err() && worker_panic.is_none() {
-                worker_panic = Some(anyhow::anyhow!("scene detection worker thread panicked"));
-            }
-        }
-        drain_parallel_progress(&progress_rx, progress_callback);
-
-        // Prefer the reconcile error (it carries the specific per-worker failure
-        // message forwarded via `Done`); fall back to a worker join panic.
-        let mut results = reconcile_result?;
-        if let Some(worker_panic) = worker_panic {
-            return Err(worker_panic);
-        }
+        let mut results = finish_parallel_workers(
+            reconcile_handle,
+            worker_handles,
+            &stop_after,
+            &progress_rx,
+            progress_callback,
+        )?;
 
         let produced = read_result?;
         results.frame_count = produced.min(results.frame_count);
@@ -1156,14 +1141,12 @@ where
                         )
                     }));
                     let message = match result {
-                        Ok(Ok(frame_count)) => ParallelWorkerMessage::Done {
+                        Ok(Ok(_)) => ParallelWorkerMessage::Done {
                             worker,
-                            frame_count,
                             error: None,
                         },
                         Ok(Err(error)) => ParallelWorkerMessage::Done {
                             worker,
-                            frame_count: start_frame,
                             error: Some(error.to_string()),
                         },
                         Err(payload) => {
@@ -1175,7 +1158,6 @@ where
                             let detail = parallel_panic_message(&*payload);
                             ParallelWorkerMessage::Done {
                                 worker,
-                                frame_count: start_frame,
                                 error: Some(format!("worker {worker} panicked: {detail}")),
                             }
                         }
@@ -1204,30 +1186,13 @@ where
             drain_parallel_progress(&progress_rx, progress_callback);
             thread::sleep(PARALLEL_READER_WAIT);
         }
-        let reconcile_result = reconcile_handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("scene detection reconciliation thread panicked"))
-            .and_then(|inner| inner);
-        drain_parallel_progress(&progress_rx, progress_callback);
-
-        // Stop every worker, then ALWAYS join them before returning so a scoped
-        // worker panic is consumed here (converted to `Err`) instead of being
-        // re-thrown as an API-level panic when this closure returns (C4 defect 1).
-        for stop in &stop_after {
-            stop.store(0, Ordering::Release);
-        }
-        let mut worker_panic: Option<anyhow::Error> = None;
-        for handle in worker_handles {
-            if handle.join().is_err() && worker_panic.is_none() {
-                worker_panic = Some(anyhow::anyhow!("scene detection worker thread panicked"));
-            }
-        }
-        drain_parallel_progress(&progress_rx, progress_callback);
-
-        let mut results = reconcile_result?;
-        if let Some(worker_panic) = worker_panic {
-            return Err(worker_panic);
-        }
+        let mut results = finish_parallel_workers(
+            reconcile_handle,
+            worker_handles,
+            &stop_after,
+            &progress_rx,
+            progress_callback,
+        )?;
 
         results.speed = results.frame_count as f64 / start_time.elapsed().as_secs_f64();
         if let Some(progress_fn) = progress_callback {
@@ -1392,34 +1357,6 @@ fn read_parallel_indexed_frames<'scope, T: Pixel>(
     }
 
     store.fail("indexed scene detection reader stopped".to_string());
-    Ok(frame_count)
-}
-
-#[cfg(not(feature = "vapoursynth"))]
-#[expect(clippy::too_many_arguments)]
-fn read_parallel_indexed_frames<'scope, T: Pixel>(
-    dec: &mut Decoder,
-    frame_count: usize,
-    store: &SharedFrameStore<T>,
-    needed_from: &[Arc<AtomicUsize>],
-    frame_request_rx: Receiver<usize>,
-    worker_handles: &[thread::ScopedJoinHandle<'scope, ()>],
-    reconcile_handle: &thread::ScopedJoinHandle<'scope, anyhow::Result<DetectionResults>>,
-    progress_rx: &Option<Receiver<(usize, usize)>>,
-    progress_callback: Option<&dyn Fn(usize, usize)>,
-    frame_reducer: &analyze::ParallelFrameReducer<T>,
-) -> anyhow::Result<usize> {
-    let _ = (
-        dec,
-        store,
-        needed_from,
-        frame_request_rx,
-        worker_handles,
-        reconcile_handle,
-        progress_rx,
-        progress_callback,
-        frame_reducer,
-    );
     Ok(frame_count)
 }
 
@@ -1634,6 +1571,47 @@ fn parallel_active_needed_window(needed_from: &[Arc<AtomicUsize>]) -> Option<(us
     (active_workers != 0).then_some((keep_from, active_workers))
 }
 
+/// Joins the reconcile thread, then stops and joins every worker, returning the
+/// reconciled [`DetectionResults`]. Shared by both parallel entries (Q5).
+///
+/// Joining a scoped worker consumes its panic payload, which is what stops
+/// `thread::scope` from re-throwing a worker panic as an API-level panic
+/// (C4 defect 1); workers are therefore ALWAYS stopped and joined, even when
+/// reconcile failed. The reconcile error is preferred (it carries the specific
+/// per-worker failure forwarded via `Done`); a bare worker-join panic is the
+/// fallback. Callers must finish any reader work that borrows `reconcile_handle`
+/// / `worker_handles` before calling this, since both are consumed here.
+fn finish_parallel_workers<'scope>(
+    reconcile_handle: thread::ScopedJoinHandle<'scope, anyhow::Result<DetectionResults>>,
+    worker_handles: Vec<thread::ScopedJoinHandle<'scope, ()>>,
+    stop_after: &[Arc<AtomicUsize>],
+    progress_rx: &Option<Receiver<(usize, usize)>>,
+    progress_callback: Option<&dyn Fn(usize, usize)>,
+) -> anyhow::Result<DetectionResults> {
+    let reconcile_result = reconcile_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("scene detection reconciliation thread panicked"))
+        .and_then(|inner| inner);
+    drain_parallel_progress(progress_rx, progress_callback);
+
+    for stop in stop_after {
+        stop.store(0, Ordering::Release);
+    }
+    let mut worker_panic: Option<anyhow::Error> = None;
+    for handle in worker_handles {
+        if handle.join().is_err() && worker_panic.is_none() {
+            worker_panic = Some(anyhow::anyhow!("scene detection worker thread panicked"));
+        }
+    }
+    drain_parallel_progress(progress_rx, progress_callback);
+
+    let results = reconcile_result?;
+    if let Some(worker_panic) = worker_panic {
+        return Err(worker_panic);
+    }
+    Ok(results)
+}
+
 fn drain_parallel_progress(
     progress_rx: &Option<Receiver<(usize, usize)>>,
     progress_callback: Option<&dyn Fn(usize, usize)>,
@@ -1659,7 +1637,6 @@ enum ParallelWorkerMessage {
     },
     Done {
         worker: usize,
-        frame_count: usize,
         error: Option<String>,
     },
     ReaderDone {
@@ -1887,6 +1864,97 @@ fn run_parallel_worker<T: Pixel>(
     frame_request_tx: Option<Sender<usize>>,
     use_cost_parallelism: bool,
 ) -> anyhow::Result<usize> {
+    // Streamed-store frame acquisition: keep the shared `needed_from` watermark
+    // and the reader's per-frame request channel updated, then block in the
+    // store until the reader thread produces the frame (or signals end). The
+    // analysis loop itself is shared with the indexed worker (Q4).
+    let _needed_guard = ParallelWorkerNeedGuard::new(Arc::clone(&needed_from), Arc::clone(&store));
+    needed_from.store(
+        parallel_initial_fetch_start(start_frame, opts),
+        Ordering::Release,
+    );
+    store.notify_waiters();
+
+    run_parallel_analysis_loop::<T, _>(
+        worker,
+        start_frame,
+        frame_limit,
+        video_details,
+        opts,
+        &tx,
+        &stop_after,
+        use_cost_parallelism,
+        |next_input_frameno, frame_limit| {
+            needed_from.store(next_input_frameno, Ordering::Release);
+            store.notify_waiters();
+            if let Some(frame_request_tx) = &frame_request_tx {
+                let _ = frame_request_tx.send(next_input_frameno);
+            }
+            match store.get(next_input_frameno, frame_limit)? {
+                Some(frame) => {
+                    // Mirror the pre-dedup post-push `needed_from` bump to
+                    // `next_input_frameno + 1`. Ordering relative to the loop's
+                    // local `push_next` is irrelevant: only this atomic store +
+                    // notify is observable by the reader thread, which never
+                    // inspects the worker-local frame queue.
+                    needed_from.store(next_input_frameno + 1, Ordering::Release);
+                    store.notify_waiters();
+                    Ok(ParallelFetchOutcome::Frame(frame))
+                }
+                // The store already reflects the real end via the orchestrator's
+                // single `ReaderDone`; do not lower this worker's `frame_limit`.
+                None => Ok(ParallelFetchOutcome::Stop),
+            }
+        },
+    )
+}
+
+/// One frame-acquisition result for [`run_parallel_analysis_loop`]'s `fetch`
+/// closure. The shared loop never reads the store or a decoder itself: the
+/// closure abstracts streamed [`SharedFrameStore::get`] vs an indexed decoder's
+/// `get_video_frame`, so the window-fill + analyze + emit body lives in one
+/// place (Q4).
+enum ParallelFetchOutcome<T: Pixel> {
+    /// The requested input frame; push it and keep filling the window.
+    Frame(Arc<Frame<T>>),
+    /// Stop filling the window now without lowering the worker's `frame_limit`
+    /// (streamed: the store returned `None`; the real end is already reflected by
+    /// the orchestrator's single `ReaderDone`).
+    Stop,
+    /// Stop filling the window AND clamp the worker's `frame_limit` to this
+    /// (worker-relative) index — the indexed-decoder EOF path, where the worker
+    /// is the only party that can discover the true decodable length (C5). Only
+    /// constructed by the vapoursynth indexed worker; in other builds the variant
+    /// is unreferenced, but the shared loop still matches it.
+    #[cfg_attr(not(feature = "vapoursynth"), allow(dead_code))]
+    StopAt(usize),
+}
+
+/// Shared body of the two parallel scene-detection workers
+/// ([`run_parallel_worker`], streamed-store, and `run_parallel_indexed_decoder_worker`,
+/// vapoursynth indexed-decoder). They differ only in how an input frame is
+/// acquired, so that step is delegated to `fetch`; the window-fill + analyze +
+/// emit loop lives here once (Q4). `fetch(next_input_frameno, frame_limit)`
+/// returns the requested frame, [`ParallelFetchOutcome::Stop`] to end the window
+/// fill, or [`ParallelFetchOutcome::StopAt`] to additionally clamp `frame_limit`.
+/// Returns the next un-analyzed (worker-relative) frame index, i.e. the number
+/// of frames this worker advanced through.
+#[expect(clippy::too_many_arguments)]
+fn run_parallel_analysis_loop<T, Fetch>(
+    worker: usize,
+    start_frame: usize,
+    mut frame_limit: usize,
+    video_details: &av_decoders::VideoDetails,
+    opts: DetectionOptions,
+    tx: &Sender<ParallelWorkerMessage>,
+    stop_after: &AtomicUsize,
+    use_cost_parallelism: bool,
+    mut fetch: Fetch,
+) -> anyhow::Result<usize>
+where
+    T: Pixel,
+    Fetch: FnMut(usize, usize) -> anyhow::Result<ParallelFetchOutcome<T>>,
+{
     let effective_lookahead = opts.effective_lookahead_distance();
     let frame_history = parallel_frame_history(opts);
     assert!(effective_lookahead >= 1);
@@ -1901,9 +1969,6 @@ fn run_parallel_worker<T: Pixel>(
     let mut keyframes = BTreeSet::new();
     keyframes.insert(start_frame);
 
-    let _needed_guard = ParallelWorkerNeedGuard::new(Arc::clone(&needed_from), Arc::clone(&store));
-    needed_from.store(initial_fetch_start, Ordering::Release);
-    store.notify_waiters();
     let mut frameno = start_frame;
     loop {
         let stop = stop_after.load(Ordering::Acquire);
@@ -1914,19 +1979,16 @@ fn run_parallel_worker<T: Pixel>(
         let max_needed = (frameno + effective_lookahead + 1).min(frame_limit);
 
         while next_input_frameno < max_needed {
-            needed_from.store(next_input_frameno, Ordering::Release);
-            store.notify_waiters();
-            if let Some(frame_request_tx) = &frame_request_tx {
-                let _ = frame_request_tx.send(next_input_frameno);
-            }
-            match store.get(next_input_frameno, frame_limit)? {
-                Some(frame) => {
+            match fetch(next_input_frameno, frame_limit)? {
+                ParallelFetchOutcome::Frame(frame) => {
                     frame_queue.push_next(next_input_frameno, frame);
                     next_input_frameno += 1;
-                    needed_from.store(next_input_frameno, Ordering::Release);
-                    store.notify_waiters();
                 }
-                None => break,
+                ParallelFetchOutcome::Stop => break,
+                ParallelFetchOutcome::StopAt(end) => {
+                    frame_limit = frame_limit.min(end);
+                    break;
+                }
             }
         }
 
@@ -1990,7 +2052,7 @@ fn run_parallel_indexed_decoder_worker<T, F>(
     worker: usize,
     start_frame: usize,
     frame_start: usize,
-    mut frame_limit: usize,
+    frame_limit: usize,
     video_details: &av_decoders::VideoDetails,
     opts: DetectionOptions,
     tx: Sender<ParallelWorkerMessage>,
@@ -2004,31 +2066,24 @@ where
 {
     let mut source = make_decoder(worker)?;
     let frame_reducer = parallel_frame_reducer::<T>(opts, video_details);
-    let effective_lookahead = opts.effective_lookahead_distance();
-    let frame_history = parallel_frame_history(opts);
-    assert!(effective_lookahead >= 1);
 
-    let initial_fetch_start = parallel_initial_fetch_start(start_frame, opts);
-    let mut detector =
-        new_detector_from_video_details::<T>(video_details, opts, use_cost_parallelism);
-    detector.set_frames_pre_downscaled(frame_reducer.is_prescaled());
-    let mut frame_queue = FrameWindow::new(initial_fetch_start);
-    let mut keyframes = BTreeSet::new();
-    keyframes.insert(start_frame);
-
-    let mut frameno = start_frame;
-    loop {
-        let stop = stop_after.load(Ordering::Acquire);
-        if frameno >= frame_limit || frameno >= stop {
-            break;
-        }
-        let mut next_input_frameno = frame_queue.next_frame();
-        let max_needed = (frameno + effective_lookahead + 1).min(frame_limit);
-
-        while next_input_frameno < max_needed {
+    // Indexed-decoder frame acquisition: each worker owns a decoder and seeks
+    // directly. The analysis loop is shared with the streamed worker (Q4).
+    run_parallel_analysis_loop::<T, _>(
+        worker,
+        start_frame,
+        frame_limit,
+        video_details,
+        opts,
+        &tx,
+        &stop_after,
+        use_cost_parallelism,
+        |next_input_frameno, _frame_limit| {
             let source_frame = frame_start + next_input_frameno;
-            let frame = match source.get_video_frame(source_frame) {
-                Ok(frame) => frame,
+            match source.get_video_frame(source_frame) {
+                Ok(frame) => Ok(ParallelFetchOutcome::Frame(Arc::new(
+                    frame_reducer.apply(frame),
+                ))),
                 Err(av_decoders::DecoderError::EndOfFile) => {
                     // `next_input_frameno` is the first non-decodable
                     // (worker-relative) index, so the true decodable length is
@@ -2039,91 +2094,33 @@ where
                     // otherwise: report the discovered real end ourselves so
                     // reconcile can clamp `actual_frame_limit` and actually
                     // complete (a graceful break alone would leave it stuck on the
-                    // over-estimate). Then clamp our own `frame_limit` so the outer
-                    // loop terminates promptly and this fetch never re-requests a
-                    // past-EOF index. Analyze the frames already obtained; this is
-                    // a graceful stop, NOT an error (C5).
+                    // over-estimate). `StopAt` then clamps the loop's own
+                    // `frame_limit` so the outer loop terminates promptly and this
+                    // fetch never re-requests a past-EOF index. The frames already
+                    // obtained are analyzed; this is a graceful stop, NOT an error
+                    // (C5).
                     let _ = tx.send(ParallelWorkerMessage::ReaderDone {
                         frame_count: next_input_frameno,
                     });
-                    frame_limit = frame_limit.min(next_input_frameno);
-                    break;
+                    Ok(ParallelFetchOutcome::StopAt(next_input_frameno))
                 }
-                Err(error) => {
-                    return Err(anyhow::anyhow!(
-                        "worker {worker} failed to read frame {source_frame}: {error}"
-                    ));
-                }
-            };
-            frame_queue.push_next(next_input_frameno, Arc::new(frame_reducer.apply(frame)));
-            next_input_frameno += 1;
-        }
-
-        let frame_set_start = frameno.saturating_sub(1);
-        let frame_set = frame_queue.refs_from(frame_set_start, effective_lookahead + 2);
-        if frame_set.len() < 2 {
-            break;
-        }
-
-        let mut decision = ParallelFrameDecision {
-            is_scene_change: false,
-            score: None,
-        };
-        if worker == 0 && frameno == 0 {
-            decision.is_scene_change = true;
-        } else {
-            let previous_frame_set = frame_queue.refs_range(
-                frameno.saturating_sub(frame_history.saturating_add(1)),
-                frameno,
-            );
-            let (cut, score) = detector.analyze_next_frame_with_history(
-                &frame_set,
-                &previous_frame_set,
-                frameno,
-                *keyframes
-                    .iter()
-                    .last()
-                    .expect("at least 1 keyframe should exist"),
-            );
-            decision.score = score;
-            if cut {
-                keyframes.insert(frameno);
-                decision.is_scene_change = true;
+                Err(error) => Err(anyhow::anyhow!(
+                    "worker {worker} failed to read frame {source_frame}: {error}"
+                )),
             }
-        }
-
-        if tx
-            .send(ParallelWorkerMessage::Frame {
-                worker,
-                frame: frameno,
-                decision,
-            })
-            .is_err()
-        {
-            break;
-        }
-
-        drop(frame_set);
-        let remove_before = frameno.saturating_sub(frame_history.saturating_add(1));
-        frame_queue.prune_before(remove_before);
-
-        frameno += 1;
-    }
-
-    Ok(frameno)
+        },
+    )
 }
 
 #[derive(Default)]
 struct ParallelWorkerOutput {
     frames: BTreeMap<usize, ParallelFrameDecision>,
     done: bool,
-    frame_count: usize,
 }
 
 impl ParallelWorkerOutput {
     fn insert(&mut self, frame: usize, decision: ParallelFrameDecision) {
         self.frames.insert(frame, decision);
-        self.frame_count = self.frame_count.max(frame + 1);
     }
 
     fn contiguous_end_from(&self, start: usize, frame_limit: usize) -> usize {
@@ -2214,11 +2211,7 @@ fn reconcile_parallel_workers(
                     );
                 }
             }
-            ParallelWorkerMessage::Done {
-                worker,
-                frame_count,
-                error,
-            } => {
+            ParallelWorkerMessage::Done { worker, error } => {
                 if let Some(error) = error {
                     return Err(anyhow::anyhow!(
                         "scene detection worker {worker} failed: {error}"
@@ -2226,7 +2219,6 @@ fn reconcile_parallel_workers(
                 }
                 if let Some(output) = outputs.get_mut(worker) {
                     output.done = true;
-                    output.frame_count = output.frame_count.max(frame_count);
                 }
             }
             ParallelWorkerMessage::ReaderDone { frame_count } => {
@@ -2694,10 +2686,61 @@ const TEXT_CARD_MIN_GLOBAL_IMP_RATIO: f64 = 3.8;
 const TEXT_CARD_MAX_SIMILARITY_DELTA_8BIT: f64 = 6.0;
 const TEXT_CARD_MAX_TRANSIENT_DELTA_8BIT: f64 = 3.0;
 
-fn apply_text_card_cluster_postprocess(
+/// Largest auxiliary `forward_similarity` candidate-delta threshold used by any
+/// postprocess consumer that is independent of `ForwardSimilarityOptions`.
+///
+/// Beyond the per-candidate `forward_similarity_threshold_8bit` (strict/relaxed),
+/// `ForwardSimilarityCandidate::delta` is consumed by `weak_text_card_cut`
+/// (`<= TEXT_CARD_MAX_SIMILARITY_DELTA_8BIT`) and `dark_occlusion_cut`
+/// (`<= DARK_OCCLUSION_MAX_FORWARD_DELTA_8BIT`). The forward-similarity search may
+/// only substitute a non-exact lower bound for the exact delta strictly *above*
+/// `max(effective_threshold, this)`, so this must stay >= every option-independent
+/// consumer threshold (enforced by the compile-time assertion below).
+pub(crate) const FORWARD_SIMILARITY_AUXILIARY_MAX_THRESHOLD_8BIT: f64 = 6.0;
+
+const _: () = assert!(
+    FORWARD_SIMILARITY_AUXILIARY_MAX_THRESHOLD_8BIT >= TEXT_CARD_MAX_SIMILARITY_DELTA_8BIT
+        && FORWARD_SIMILARITY_AUXILIARY_MAX_THRESHOLD_8BIT >= DARK_OCCLUSION_MAX_FORWARD_DELTA_8BIT,
+    "forward-similarity auxiliary ceiling must cover every option-independent candidate.delta consumer",
+);
+
+/// Groups eligible cuts into runs and suppresses qualifying runs.
+///
+/// A cut is eligible when `predicate` holds for its score. Consecutive eligible
+/// cuts join the same run while they stay within `max_gap` frames of the
+/// previous run member; otherwise the current run is flushed and a new one
+/// starts. A run is suppressed only when it reaches at least `min_cuts` cuts, in
+/// which case each suppressed frame is removed from `keyframes` and tagged with
+/// `decision`. When `keep_first` is set, the first cut of the run is preserved
+/// (anchoring the run) and only the remaining cuts are suppressed.
+fn suppress_predicate_runs(
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
+    predicate: fn(ScenecutResult) -> bool,
+    max_gap: usize,
+    min_cuts: usize,
+    keep_first: bool,
+    decision: ScenecutDecision,
 ) {
+    fn suppress_run(
+        run: &[usize],
+        keyframes: &mut BTreeSet<usize>,
+        scores: &mut BTreeMap<usize, ScenecutResult>,
+        min_cuts: usize,
+        keep_first: bool,
+        decision: ScenecutDecision,
+    ) {
+        if run.len() < min_cuts {
+            return;
+        }
+        for &frame in &run[usize::from(keep_first)..] {
+            keyframes.remove(&frame);
+            if let Some(score) = scores.get_mut(&frame) {
+                score.decision = decision;
+            }
+        }
+    }
+
     let cuts = keyframes
         .iter()
         .copied()
@@ -2706,39 +2749,37 @@ fn apply_text_card_cluster_postprocess(
     let mut run = Vec::new();
 
     for frame in cuts {
-        let weak_text_card_cut = scores.get(&frame).copied().is_some_and(weak_text_card_cut);
+        let eligible = scores.get(&frame).copied().is_some_and(predicate);
         let extends_run = run
             .last()
-            .is_none_or(|previous| frame - previous <= TEXT_CARD_CLUSTER_MAX_GAP);
-        if weak_text_card_cut && extends_run {
+            .is_none_or(|previous| frame - previous <= max_gap);
+        if eligible && extends_run {
             run.push(frame);
         } else {
-            suppress_text_card_run(&run, keyframes, scores);
+            suppress_run(&run, keyframes, scores, min_cuts, keep_first, decision);
             run.clear();
-            if weak_text_card_cut {
+            if eligible {
                 run.push(frame);
             }
         }
     }
 
-    suppress_text_card_run(&run, keyframes, scores);
+    suppress_run(&run, keyframes, scores, min_cuts, keep_first, decision);
 }
 
-fn suppress_text_card_run(
-    run: &[usize],
+fn apply_text_card_cluster_postprocess(
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
 ) {
-    if run.len() < TEXT_CARD_CLUSTER_MIN_CUTS {
-        return;
-    }
-
-    for &frame in run {
-        keyframes.remove(&frame);
-        if let Some(score) = scores.get_mut(&frame) {
-            score.decision = ScenecutDecision::SuppressedTextCardCluster;
-        }
-    }
+    suppress_predicate_runs(
+        keyframes,
+        scores,
+        weak_text_card_cut,
+        TEXT_CARD_CLUSTER_MAX_GAP,
+        TEXT_CARD_CLUSTER_MIN_CUTS,
+        false,
+        ScenecutDecision::SuppressedTextCardCluster,
+    );
 }
 
 fn weak_text_card_cut(score: ScenecutResult) -> bool {
@@ -2896,7 +2937,39 @@ const DARK_SCENE_PEAK_MIN_GLOBAL_IMP_RATIO: f64 = 1.4;
 const DARK_SCENE_PEAK_MIN_BAD_BLOCK_RATIO: f64 = 0.62;
 const DARK_SCENE_PEAK_MAX_GOOD_BLOCK_RATIO: f64 = 0.005;
 
-fn apply_dark_scene_peak_recovery_postprocess(
+/// Shared gating parameters for the dark/sparse scene-peak recovery passes.
+///
+/// The two passes are line-for-line identical apart from these values, so they
+/// share a single parameterized implementation
+/// ([`apply_scene_peak_recovery_postprocess`] / [`scene_peak_recovery_candidate`]).
+struct ScenePeakRecoveryConfig {
+    min_scene_len: usize,
+    local_radius: usize,
+    density_radius: usize,
+    wide_density_radius: usize,
+    max_local_cuts: usize,
+    max_wide_cuts: usize,
+    max_adjacent_cost_ratio: f64,
+    /// Predicate deciding whether a frame's score qualifies for this pass.
+    score_fn: fn(ScenecutResult) -> bool,
+    /// Decision tag stamped onto recovered keyframes.
+    decision: ScenecutDecision,
+}
+
+const DARK_SCENE_PEAK_RECOVERY_CONFIG: ScenePeakRecoveryConfig = ScenePeakRecoveryConfig {
+    min_scene_len: DARK_SCENE_PEAK_MIN_SCENE_LEN,
+    local_radius: DARK_SCENE_PEAK_LOCAL_RADIUS,
+    density_radius: DARK_SCENE_PEAK_DENSITY_RADIUS,
+    wide_density_radius: DARK_SCENE_PEAK_WIDE_DENSITY_RADIUS,
+    max_local_cuts: DARK_SCENE_PEAK_MAX_LOCAL_CUTS,
+    max_wide_cuts: DARK_SCENE_PEAK_MAX_WIDE_CUTS,
+    max_adjacent_cost_ratio: DARK_SCENE_PEAK_MAX_ADJACENT_COST_RATIO,
+    score_fn: dark_scene_peak_score,
+    decision: ScenecutDecision::CutDarkScenePeak,
+};
+
+fn apply_scene_peak_recovery_postprocess(
+    config: &ScenePeakRecoveryConfig,
     opts: DetectionOptions,
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
@@ -2905,7 +2978,7 @@ fn apply_dark_scene_peak_recovery_postprocess(
     let candidates = scores
         .iter()
         .filter_map(|(&frame, &score)| {
-            dark_scene_peak_recovery_candidate(frame, score, keyframes, scores, min_distance)
+            scene_peak_recovery_candidate(config, frame, score, keyframes, scores, min_distance)
                 .then_some(frame)
         })
         .collect::<Vec<_>>();
@@ -2916,12 +2989,13 @@ fn apply_dark_scene_peak_recovery_postprocess(
         }
         keyframes.insert(frame);
         if let Some(score) = scores.get_mut(&frame) {
-            score.decision = ScenecutDecision::CutDarkScenePeak;
+            score.decision = config.decision;
         }
     }
 }
 
-fn dark_scene_peak_recovery_candidate(
+fn scene_peak_recovery_candidate(
+    config: &ScenePeakRecoveryConfig,
     frame: usize,
     score: ScenecutResult,
     keyframes: &BTreeSet<usize>,
@@ -2931,15 +3005,11 @@ fn dark_scene_peak_recovery_candidate(
     if score.decision != ScenecutDecision::NoCut {
         return false;
     }
-    if !dark_scene_peak_score(score)
-        || !local_cost_peak(frame, scores, DARK_SCENE_PEAK_LOCAL_RADIUS)
-    {
+    if !(config.score_fn)(score) || !local_cost_peak(frame, scores, config.local_radius) {
         return false;
     }
-    if local_cut_count(keyframes, frame, DARK_SCENE_PEAK_DENSITY_RADIUS)
-        > DARK_SCENE_PEAK_MAX_LOCAL_CUTS
-        || local_cut_count(keyframes, frame, DARK_SCENE_PEAK_WIDE_DENSITY_RADIUS)
-            > DARK_SCENE_PEAK_MAX_WIDE_CUTS
+    if local_cut_count(keyframes, frame, config.density_radius) > config.max_local_cuts
+        || local_cut_count(keyframes, frame, config.wide_density_radius) > config.max_wide_cuts
     {
         return false;
     }
@@ -2950,7 +3020,7 @@ fn dark_scene_peak_recovery_candidate(
     let Some(next_cut) = keyframes.range((frame + 1)..).next().copied() else {
         return false;
     };
-    if next_cut - previous_cut < DARK_SCENE_PEAK_MIN_SCENE_LEN
+    if next_cut - previous_cut < config.min_scene_len
         || frame - previous_cut < min_distance
         || next_cut - frame < min_distance
     {
@@ -2961,8 +3031,21 @@ fn dark_scene_peak_recovery_candidate(
         .get(&previous_cut)
         .map_or(0.0, |score| score.cost_ratio);
     let next_cost_ratio = scores.get(&next_cut).map_or(0.0, |score| score.cost_ratio);
-    previous_cost_ratio <= DARK_SCENE_PEAK_MAX_ADJACENT_COST_RATIO
-        && next_cost_ratio <= DARK_SCENE_PEAK_MAX_ADJACENT_COST_RATIO
+    previous_cost_ratio <= config.max_adjacent_cost_ratio
+        && next_cost_ratio <= config.max_adjacent_cost_ratio
+}
+
+fn apply_dark_scene_peak_recovery_postprocess(
+    opts: DetectionOptions,
+    keyframes: &mut BTreeSet<usize>,
+    scores: &mut BTreeMap<usize, ScenecutResult>,
+) {
+    apply_scene_peak_recovery_postprocess(
+        &DARK_SCENE_PEAK_RECOVERY_CONFIG,
+        opts,
+        keyframes,
+        scores,
+    );
 }
 
 fn dark_scene_peak_score(score: ScenecutResult) -> bool {
@@ -3024,73 +3107,29 @@ const SPARSE_SCENE_PEAK_MAX_LUMA_8BIT: f64 = 90.0;
 const SPARSE_SCENE_PEAK_MIN_BAD_BLOCK_RATIO: f64 = 0.60;
 const SPARSE_SCENE_PEAK_MAX_GOOD_BLOCK_RATIO: f64 = 0.10;
 
+const SPARSE_SCENE_PEAK_RECOVERY_CONFIG: ScenePeakRecoveryConfig = ScenePeakRecoveryConfig {
+    min_scene_len: SPARSE_SCENE_PEAK_MIN_SCENE_LEN,
+    local_radius: SPARSE_SCENE_PEAK_LOCAL_RADIUS,
+    density_radius: SPARSE_SCENE_PEAK_DENSITY_RADIUS,
+    wide_density_radius: SPARSE_SCENE_PEAK_WIDE_DENSITY_RADIUS,
+    max_local_cuts: SPARSE_SCENE_PEAK_MAX_LOCAL_CUTS,
+    max_wide_cuts: SPARSE_SCENE_PEAK_MAX_WIDE_CUTS,
+    max_adjacent_cost_ratio: SPARSE_SCENE_PEAK_MAX_ADJACENT_COST_RATIO,
+    score_fn: sparse_scene_peak_score,
+    decision: ScenecutDecision::CutSparseScenePeak,
+};
+
 fn apply_sparse_scene_peak_recovery_postprocess(
     opts: DetectionOptions,
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
 ) {
-    let min_distance = opts.min_scenecut_distance.unwrap_or(0);
-    let candidates = scores
-        .iter()
-        .filter_map(|(&frame, &score)| {
-            sparse_scene_peak_recovery_candidate(frame, score, keyframes, scores, min_distance)
-                .then_some(frame)
-        })
-        .collect::<Vec<_>>();
-
-    for frame in candidates {
-        if !scene_distance_ok(frame, keyframes, min_distance) {
-            continue;
-        }
-        keyframes.insert(frame);
-        if let Some(score) = scores.get_mut(&frame) {
-            score.decision = ScenecutDecision::CutSparseScenePeak;
-        }
-    }
-}
-
-fn sparse_scene_peak_recovery_candidate(
-    frame: usize,
-    score: ScenecutResult,
-    keyframes: &BTreeSet<usize>,
-    scores: &BTreeMap<usize, ScenecutResult>,
-    min_distance: usize,
-) -> bool {
-    if score.decision != ScenecutDecision::NoCut {
-        return false;
-    }
-    if !sparse_scene_peak_score(score)
-        || !local_cost_peak(frame, scores, SPARSE_SCENE_PEAK_LOCAL_RADIUS)
-    {
-        return false;
-    }
-    if local_cut_count(keyframes, frame, SPARSE_SCENE_PEAK_DENSITY_RADIUS)
-        > SPARSE_SCENE_PEAK_MAX_LOCAL_CUTS
-        || local_cut_count(keyframes, frame, SPARSE_SCENE_PEAK_WIDE_DENSITY_RADIUS)
-            > SPARSE_SCENE_PEAK_MAX_WIDE_CUTS
-    {
-        return false;
-    }
-
-    let Some(previous_cut) = keyframes.range(..frame).next_back().copied() else {
-        return false;
-    };
-    let Some(next_cut) = keyframes.range((frame + 1)..).next().copied() else {
-        return false;
-    };
-    if next_cut - previous_cut < SPARSE_SCENE_PEAK_MIN_SCENE_LEN
-        || frame - previous_cut < min_distance
-        || next_cut - frame < min_distance
-    {
-        return false;
-    }
-
-    let previous_cost_ratio = scores
-        .get(&previous_cut)
-        .map_or(0.0, |score| score.cost_ratio);
-    let next_cost_ratio = scores.get(&next_cut).map_or(0.0, |score| score.cost_ratio);
-    previous_cost_ratio <= SPARSE_SCENE_PEAK_MAX_ADJACENT_COST_RATIO
-        && next_cost_ratio <= SPARSE_SCENE_PEAK_MAX_ADJACENT_COST_RATIO
+    apply_scene_peak_recovery_postprocess(
+        &SPARSE_SCENE_PEAK_RECOVERY_CONFIG,
+        opts,
+        keyframes,
+        scores,
+    );
 }
 
 fn sparse_scene_peak_score(score: ScenecutResult) -> bool {
@@ -3623,7 +3662,7 @@ fn aba_chain_from_boundary(
     let first = boundaries[start_idx];
     let second = boundaries.get(start_idx + 1).copied()?;
     if second - first > max_segment_len
-        || aba_chain_signature_delta(first, second, scores)? < ABA_CHAIN_MIN_DIFFERENT_DELTA_8BIT
+        || frame_signature_delta_for_scores(first, second, scores)? < ABA_CHAIN_MIN_DIFFERENT_DELTA_8BIT
     {
         return None;
     }
@@ -3640,11 +3679,12 @@ fn aba_chain_from_boundary(
         }
 
         let Some(same_as_previous_tag) =
-            aba_chain_signature_delta(chain[chain.len() - 2], candidate, scores)
+            frame_signature_delta_for_scores(chain[chain.len() - 2], candidate, scores)
         else {
             break;
         };
-        let Some(different_from_previous) = aba_chain_signature_delta(previous, candidate, scores)
+        let Some(different_from_previous) =
+            frame_signature_delta_for_scores(previous, candidate, scores)
         else {
             break;
         };
@@ -3704,7 +3744,7 @@ fn aba_chain_hidden_boundary(
     {
         return false;
     }
-    aba_chain_signature_delta(frame.saturating_sub(1), frame, scores)
+    frame_signature_delta_for_scores(frame.saturating_sub(1), frame, scores)
         .is_some_and(|delta| delta >= ABA_CHAIN_MIN_HIDDEN_EDGE_DELTA_8BIT)
 }
 
@@ -3713,17 +3753,6 @@ fn aba_chain_suppressible_cut(score: ScenecutResult) -> bool {
         score.decision,
         ScenecutDecision::Cut | ScenecutDecision::CutImportance | ScenecutDecision::CutAbaReturn
     )
-}
-
-fn aba_chain_signature_delta(
-    left: usize,
-    right: usize,
-    scores: &BTreeMap<usize, ScenecutResult>,
-) -> Option<f64> {
-    Some(frame_signature_delta_8bit(
-        scores.get(&left)?.frame_luma_signature?,
-        scores.get(&right)?.frame_luma_signature?,
-    ))
 }
 
 const FORWARD_SIMILARITY_RECOVERY_MIN_MATCH_DELTA_8BIT: f64 = 8.0;
@@ -3963,47 +3992,15 @@ fn apply_static_credits_postprocess(
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
 ) {
-    let cuts = keyframes
-        .iter()
-        .copied()
-        .filter(|&frame| frame != 0)
-        .collect::<Vec<_>>();
-    let mut run = Vec::new();
-
-    for frame in cuts {
-        let static_credits_cut = scores.get(&frame).copied().is_some_and(static_credits_cut);
-        let extends_run = run
-            .last()
-            .is_none_or(|previous| frame - previous <= STATIC_CREDITS_MAX_GAP);
-        if static_credits_cut && extends_run {
-            run.push(frame);
-        } else {
-            suppress_static_credits_run(&run, keyframes, scores);
-            run.clear();
-            if static_credits_cut {
-                run.push(frame);
-            }
-        }
-    }
-
-    suppress_static_credits_run(&run, keyframes, scores);
-}
-
-fn suppress_static_credits_run(
-    run: &[usize],
-    keyframes: &mut BTreeSet<usize>,
-    scores: &mut BTreeMap<usize, ScenecutResult>,
-) {
-    if run.len() < STATIC_CREDITS_MIN_RUN_CUTS {
-        return;
-    }
-
-    for &frame in &run[1..] {
-        keyframes.remove(&frame);
-        if let Some(score) = scores.get_mut(&frame) {
-            score.decision = ScenecutDecision::SuppressedStaticCredits;
-        }
-    }
+    suppress_predicate_runs(
+        keyframes,
+        scores,
+        static_credits_cut,
+        STATIC_CREDITS_MAX_GAP,
+        STATIC_CREDITS_MIN_RUN_CUTS,
+        true,
+        ScenecutDecision::SuppressedStaticCredits,
+    );
 }
 
 fn static_credits_cut(score: ScenecutResult) -> bool {
