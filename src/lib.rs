@@ -10,6 +10,7 @@ mod cpu;
 mod data;
 mod math;
 mod options;
+mod tuning;
 
 /// Hidden re-exports of internal items for benchmarking only.
 /// Not part of the stable public API.
@@ -57,6 +58,24 @@ pub use crate::{
         DetectionOptionOverride,
         ParseDetectionOptionOverrideError,
         detection_option_override_names,
+    },
+    tuning::{
+        AbaChainTuning,
+        AbaReturnTuning,
+        DarkOcclusionTuning,
+        DarkScenePeakTuning,
+        FastMotionTuning,
+        ForwardSimilarityRecoveryTuning,
+        LocalPeakRecoveryTuning,
+        MicroSceneTuning,
+        PostprocessTuning,
+        RefinedSparsePeakTuning,
+        ScenePeakGeometryTuning,
+        SignatureRescueTuning,
+        SparseScenePeakTuning,
+        StaticCreditsTuning,
+        TextBoundaryShiftTuning,
+        TextCardClusterTuning,
     },
 };
 
@@ -234,6 +253,13 @@ pub struct DetectionTuning {
     /// Optional maximum cost ratio for importance cuts above
     /// `importance_cut_dark_luma_high_8bit`.
     pub importance_cut_bright_max_cost_ratio: f64,
+    /// Extra importance ratio required per 60 8-bit luma above
+    /// `importance_cut_dark_luma_high_8bit` (`0.0` disables).
+    ///
+    /// Bright scenes produce larger absolute luma deltas for the same amount
+    /// of real change, so the evidence bar rises smoothly with brightness
+    /// instead of cutting off at a hard luma cap.
+    pub importance_cut_bright_ratio_slope: f64,
     /// Lower importance ratio accepted when a cut starts after quiet blocks.
     pub importance_cut_relaxed_ratio: Option<f64>,
     /// Maximum amount subtracted from relaxed importance ratio in dark scenes.
@@ -256,6 +282,43 @@ pub struct DetectionTuning {
     /// High values usually mean localized motion, titles, or effects changed
     /// sharply while most of the frame still tracks well.
     pub importance_cut_max_me_good_ratio: f64,
+    /// Minimum per-block intra cost, as a fraction of the frame's mean intra
+    /// cost, for a well-matched block to count against
+    /// `importance_cut_max_me_good_ratio` (`0.0` counts every block).
+    ///
+    /// Flat blocks (bars, walls, sky, darkness) match across *any* cut, so
+    /// they carry no "the frame still tracks well" evidence. Note that film
+    /// grain lifts every block's intra cost well above small fractions of the
+    /// mean, so this floor only discriminates on effectively grain-free
+    /// content.
+    pub importance_cut_good_block_min_intra_ratio: f64,
+    /// Cost ratio at or above which the
+    /// `importance_cut_max_me_good_ratio` gate is skipped (`0.0` always
+    /// applies the gate).
+    ///
+    /// The gate rejects "localized change while most of the frame still
+    /// tracks well"; once the whole-frame cost is a large fraction of the cut
+    /// threshold that claim is void, and well-matched flat/grainy areas
+    /// shared across a real cut must not veto it.
+    pub importance_cut_good_gate_max_cost_ratio: f64,
+    /// How much the strict importance requirement drops per unit of cost
+    /// ratio above `importance_cut_good_gate_max_cost_ratio` (clamped at
+    /// `importance_cut_dark_min_ratio`; `0.0` disables).
+    ///
+    /// Near-threshold whole-frame cost and importance evidence trade off on a
+    /// continuum: a frame at 90% of the cut threshold needs less extra
+    /// importance proof than one at 60%.
+    pub importance_cut_strict_ratio_cr_slope: f64,
+    /// Minimum importance ratio for the backward-cost fallback below.
+    pub importance_cut_backward_min_imp_ratio: f64,
+    /// Backward-cost fraction of the threshold accepted as the relaxed
+    /// path's cost evidence when the forward cost ratio is destroyed by
+    /// following motion (`0.0` disables the fallback).
+    ///
+    /// At a cut into a high-motion scene the forward-adjusted cost is
+    /// min-subtracted to ~0, but the backward cost still measures the change
+    /// from the previous scene; with a strong importance peak that is enough.
+    pub importance_cut_backward_min_cost_ratio: f64,
     /// Optional A-B-A transient suppression.
     pub forward_similarity: ForwardSimilarityOptions,
     /// Optional two-sided masked similarity suppression for transient cuts.
@@ -266,6 +329,8 @@ pub struct DetectionTuning {
     /// switch is intended for analysis runs that need to inspect how much of a
     /// candidate can be explained by motion compensation.
     pub motion_cost_diagnostics: bool,
+    /// Thresholds for the High-mode postprocess passes (see [`PostprocessTuning`]).
+    pub postprocess: PostprocessTuning,
 }
 
 impl Default for DetectionTuning {
@@ -284,6 +349,7 @@ impl Default for DetectionTuning {
             importance_cut_min_cost_ratio: 0.0,
             importance_cut_max_luma_8bit: None,
             importance_cut_bright_max_cost_ratio: 0.0,
+            importance_cut_bright_ratio_slope: 0.0,
             importance_cut_relaxed_ratio: None,
             importance_cut_dark_ratio_boost: 0.0,
             importance_cut_dark_min_ratio: 0.0,
@@ -293,9 +359,15 @@ impl Default for DetectionTuning {
             importance_cut_relaxed_max_previous_ratio: 2.2,
             importance_cut_min_me_bad_ratio: 0.0,
             importance_cut_max_me_good_ratio: 0.0,
+            importance_cut_good_block_min_intra_ratio: 0.0,
+            importance_cut_good_gate_max_cost_ratio: 0.0,
+            importance_cut_strict_ratio_cr_slope: 0.0,
+            importance_cut_backward_min_imp_ratio: 0.0,
+            importance_cut_backward_min_cost_ratio: 0.0,
             forward_similarity: ForwardSimilarityOptions::default(),
             transient_similarity: TransientSimilarityOptions::default(),
             motion_cost_diagnostics: false,
+            postprocess: PostprocessTuning::default(),
         }
     }
 }
@@ -319,17 +391,34 @@ impl DetectionTuning {
             strong_cut_ratio: Some(2.5),
             importance_cut_ratio: Some(3.2),
             importance_cut_min_cost_ratio: 0.20,
-            importance_cut_max_luma_8bit: Some(64.0),
-            importance_cut_bright_max_cost_ratio: 0.9,
+            // Bright scenes are governed by the smooth ratio slope below
+            // rather than a hard luma cap / bright cost-ratio cap: the caps
+            // (previously 64.0 / 0.9) rejected legitimate cuts wholesale in
+            // daylight-heavy sources while the slope keeps the evidence bar
+            // rising with brightness.
+            importance_cut_max_luma_8bit: None,
+            importance_cut_bright_max_cost_ratio: 0.0,
+            importance_cut_bright_ratio_slope: 0.5,
             importance_cut_relaxed_ratio: Some(3.0),
-            importance_cut_dark_ratio_boost: 0.65,
-            importance_cut_dark_min_ratio: 2.35,
+            // Boost must reach the floor (3.0 - boost <= floor), otherwise the
+            // floor is unreachable; 0.65/2.35 missed a band of real dark cuts
+            // at imp 1.9-2.35 (verified against ground truth on two sources
+            // at negligible FP cost).
+            importance_cut_dark_ratio_boost: 1.1,
+            importance_cut_dark_min_ratio: 1.9,
             importance_cut_dark_luma_low_8bit: 25.0,
             importance_cut_dark_luma_high_8bit: 60.0,
             importance_cut_relaxed_min_cost_ratio: 0.08,
             importance_cut_relaxed_max_previous_ratio: 2.2,
             importance_cut_min_me_bad_ratio: 0.15,
             importance_cut_max_me_good_ratio: 0.05,
+            // Grain defeats the intra-texture floor (see the field docs), so
+            // the preset relies on the cost-ratio skip below instead.
+            importance_cut_good_block_min_intra_ratio: 0.0,
+            importance_cut_good_gate_max_cost_ratio: 0.55,
+            importance_cut_strict_ratio_cr_slope: 2.6,
+            importance_cut_backward_min_imp_ratio: 4.5,
+            importance_cut_backward_min_cost_ratio: 0.5,
             forward_similarity: ForwardSimilarityOptions {
                 enabled: true,
                 frames: 80,
@@ -359,7 +448,10 @@ impl DetectionTuning {
                 enabled: true,
                 frames: 10,
                 threshold_8bit: 6.0,
-                dark_threshold_8bit: 4.0,
+                // 4.0 suppressed real dark cuts with deltas 4.0-5.0 (verified
+                // against ground truth on two sources); genuine transients sit
+                // at <= ~2.9.
+                dark_threshold_8bit: 3.0,
                 dark_luma_low_8bit: 25.0,
                 dark_luma_high_8bit: 60.0,
                 mask_percent: 0.20,
@@ -2482,17 +2574,65 @@ fn apply_scenechange_postprocess(
 ) {
     apply_forward_similarity_postprocess(opts.tuning.forward_similarity, keyframes, scores);
     if opts.analysis_speed == SceneDetectionSpeed::High {
-        apply_text_card_cluster_postprocess(keyframes, scores);
-        apply_fast_motion_micro_split_postprocess(keyframes, scores);
-        apply_dark_occlusion_postprocess(keyframes, scores);
+        let pp = &opts.tuning.postprocess;
+        apply_text_card_cluster_postprocess(&pp.text_card, keyframes, scores);
+        apply_fast_motion_micro_split_postprocess(&pp.fast_motion, keyframes, scores);
+        apply_dark_occlusion_postprocess(&pp.dark_occlusion, keyframes, scores);
         apply_dark_scene_peak_recovery_postprocess(opts, keyframes, scores);
         apply_sparse_scene_peak_recovery_postprocess(opts, keyframes, scores);
         apply_refined_sparse_peak_postprocess(opts, keyframes, scores);
-        apply_aba_return_recovery_postprocess(opts, keyframes, scores);
-        apply_aba_chain_compaction_postprocess(opts, keyframes, scores);
+        apply_local_peak_recovery_postprocess(&pp.local_peak, opts, keyframes, scores);
+        apply_signature_rescue_postprocess(&pp.signature_rescue, opts, keyframes, scores);
+        // The A-B-A passes complement forward-similarity's transient-return
+        // merging; when the operator disables forward similarity they expect
+        // no A-B-A chain assembly at all, so both passes follow that switch.
+        if opts.tuning.forward_similarity.enabled {
+            apply_aba_return_recovery_postprocess(opts, keyframes, scores);
+            apply_aba_chain_compaction_postprocess(opts, keyframes, scores);
+        }
         apply_forward_similarity_recovery_postprocess(opts, keyframes, scores);
         apply_text_boundary_shift_postprocess(opts, keyframes, scores);
-        apply_static_credits_postprocess(keyframes, scores);
+        apply_static_credits_postprocess(&pp.static_credits, keyframes, scores);
+        apply_micro_scene_compaction_postprocess(&pp.micro_scene, keyframes, scores);
+    }
+}
+
+/// Collapses degenerate micro-scenes the detector itself produced.
+///
+/// Any scene shorter than `min_scene_len` frames loses its weaker boundary
+/// (lower `cost_ratio`; frame 0 is never removed), repeatedly until no such
+/// scene remains. This handles rapid strobing intros firing `CutImportance`
+/// every couple of frames and the importance/cost double-fire that yields
+/// one-frame scenes, without relying on the encoder-side min-scene-len merge.
+fn apply_micro_scene_compaction_postprocess(
+    pp: &MicroSceneTuning,
+    keyframes: &mut BTreeSet<usize>,
+    scores: &mut BTreeMap<usize, ScenecutResult>,
+) {
+    if pp.min_scene_len <= 1 {
+        return;
+    }
+    let cost_ratio = |frame: usize, scores: &BTreeMap<usize, ScenecutResult>| {
+        scores.get(&frame).map_or(0.0, |score| score.cost_ratio)
+    };
+    loop {
+        let cuts = keyframes.iter().copied().collect::<Vec<_>>();
+        let short_pair = cuts
+            .windows(2)
+            .find(|pair| pair[1] - pair[0] < pp.min_scene_len)
+            .map(|pair| (pair[0], pair[1]));
+        let Some((first, second)) = short_pair else {
+            return;
+        };
+        let weaker = if first == 0 || cost_ratio(first, scores) >= cost_ratio(second, scores) {
+            second
+        } else {
+            first
+        };
+        keyframes.remove(&weaker);
+        if let Some(score) = scores.get_mut(&weaker) {
+            score.decision = ScenecutDecision::SuppressedMicroScene;
+        }
     }
 }
 
@@ -2677,14 +2817,11 @@ fn mark_forward_similarity_suppressed(
     }
 }
 
-const TEXT_CARD_CLUSTER_MIN_CUTS: usize = 3;
-const TEXT_CARD_CLUSTER_MAX_GAP: usize = 130;
-const TEXT_CARD_MAX_COST_RATIO: f64 = 0.40;
-const TEXT_CARD_MAX_LUMA_8BIT: f64 = 35.0;
-const TEXT_CARD_MAX_IMP_RATIO: f64 = 4.0;
-const TEXT_CARD_MIN_GLOBAL_IMP_RATIO: f64 = 3.8;
+/// Ceiling on the `forward_similarity` candidate deltas `weak_text_card_cut`
+/// may consume; pinned as a `const` (not a [`TextCardClusterTuning`] field)
+/// because the compile-time assertion below ties it to the forward-similarity
+/// search's exact-delta guarantee.
 const TEXT_CARD_MAX_SIMILARITY_DELTA_8BIT: f64 = 6.0;
-const TEXT_CARD_MAX_TRANSIENT_DELTA_8BIT: f64 = 3.0;
 
 /// Largest auxiliary `forward_similarity` candidate-delta threshold used by any
 /// postprocess consumer that is independent of `ForwardSimilarityOptions`.
@@ -2716,7 +2853,7 @@ const _: () = assert!(
 fn suppress_predicate_runs(
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
-    predicate: fn(ScenecutResult) -> bool,
+    predicate: impl Fn(ScenecutResult) -> bool,
     max_gap: usize,
     min_cuts: usize,
     keep_first: bool,
@@ -2749,7 +2886,7 @@ fn suppress_predicate_runs(
     let mut run = Vec::new();
 
     for frame in cuts {
-        let eligible = scores.get(&frame).copied().is_some_and(predicate);
+        let eligible = scores.get(&frame).copied().is_some_and(&predicate);
         let extends_run = run
             .last()
             .is_none_or(|previous| frame - previous <= max_gap);
@@ -2768,35 +2905,36 @@ fn suppress_predicate_runs(
 }
 
 fn apply_text_card_cluster_postprocess(
+    pp: &TextCardClusterTuning,
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
 ) {
     suppress_predicate_runs(
         keyframes,
         scores,
-        weak_text_card_cut,
-        TEXT_CARD_CLUSTER_MAX_GAP,
-        TEXT_CARD_CLUSTER_MIN_CUTS,
+        |score| weak_text_card_cut(pp, score),
+        pp.max_gap,
+        pp.min_cuts,
         false,
         ScenecutDecision::SuppressedTextCardCluster,
     );
 }
 
-fn weak_text_card_cut(score: ScenecutResult) -> bool {
+fn weak_text_card_cut(pp: &TextCardClusterTuning, score: ScenecutResult) -> bool {
     if score.decision != ScenecutDecision::CutImportance {
         return false;
     }
-    if score.cost_ratio > TEXT_CARD_MAX_COST_RATIO
-        || score.avg_luma_8bit > TEXT_CARD_MAX_LUMA_8BIT
-        || score.imp_block_ratio > TEXT_CARD_MAX_IMP_RATIO
-        || score.global_imp_block_ratio < TEXT_CARD_MIN_GLOBAL_IMP_RATIO
+    if score.cost_ratio > pp.max_cost_ratio
+        || score.avg_luma_8bit > pp.max_luma_8bit
+        || score.imp_block_ratio > pp.max_imp_ratio
+        || score.global_imp_block_ratio < pp.min_global_imp_ratio
     {
         return false;
     }
 
     score
         .transient_similarity_score
-        .is_some_and(|delta| delta <= TEXT_CARD_MAX_TRANSIENT_DELTA_8BIT)
+        .is_some_and(|delta| delta <= pp.max_transient_delta_8bit)
         || score
             .forward_similarity_candidates
             .iter()
@@ -2804,17 +2942,8 @@ fn weak_text_card_cut(score: ScenecutResult) -> bool {
             .any(|candidate| candidate.delta <= TEXT_CARD_MAX_SIMILARITY_DELTA_8BIT)
 }
 
-const FAST_MOTION_PAIR_MAX_GAP: usize = 24;
-const FAST_MOTION_PAIR_MAX_EXIT_GAP: usize = 80;
-const FAST_MOTION_PAIR_MIN_PREVIOUS_GAP: usize = 80;
-const FAST_MOTION_MAX_COST_RATIO: f64 = 0.35;
-const FAST_MOTION_MIN_GLOBAL_IMP_RATIO: f64 = 4.0;
-const FAST_MOTION_MIN_IMP_RATIO: f64 = 2.7;
-const FAST_MOTION_MIN_LUMA_8BIT: f64 = 45.0;
-const FAST_MOTION_MIN_TRANSIENT_DELTA_8BIT: f64 = 6.0;
-const FAST_MOTION_EXIT_MIN_COST_RATIO: f64 = 1.2;
-
 fn apply_fast_motion_micro_split_postprocess(
+    pp: &FastMotionTuning,
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
 ) {
@@ -2828,9 +2957,9 @@ fn apply_fast_motion_micro_split_postprocess(
         let &[previous, first, second, exit] = window else {
             continue;
         };
-        if first - previous < FAST_MOTION_PAIR_MIN_PREVIOUS_GAP
-            || second - first > FAST_MOTION_PAIR_MAX_GAP
-            || exit - second > FAST_MOTION_PAIR_MAX_EXIT_GAP
+        if first - previous < pp.pair_min_previous_gap
+            || second - first > pp.pair_max_gap
+            || exit - second > pp.pair_max_exit_gap
         {
             continue;
         }
@@ -2843,9 +2972,9 @@ fn apply_fast_motion_micro_split_postprocess(
         let Some(exit_score) = scores.get(&exit).copied() else {
             continue;
         };
-        if !weak_fast_motion_split(first_score)
-            || !weak_fast_motion_split(second_score)
-            || !strong_fast_motion_exit(exit_score)
+        if !weak_fast_motion_split(pp, first_score)
+            || !weak_fast_motion_split(pp, second_score)
+            || !strong_fast_motion_exit(pp, exit_score)
         {
             continue;
         }
@@ -2859,31 +2988,29 @@ fn apply_fast_motion_micro_split_postprocess(
     }
 }
 
-fn weak_fast_motion_split(score: ScenecutResult) -> bool {
+fn weak_fast_motion_split(pp: &FastMotionTuning, score: ScenecutResult) -> bool {
     score.decision == ScenecutDecision::CutImportance
-        && score.cost_ratio <= FAST_MOTION_MAX_COST_RATIO
-        && score.imp_block_ratio >= FAST_MOTION_MIN_IMP_RATIO
-        && score.global_imp_block_ratio >= FAST_MOTION_MIN_GLOBAL_IMP_RATIO
-        && score.avg_luma_8bit >= FAST_MOTION_MIN_LUMA_8BIT
+        && score.cost_ratio <= pp.max_cost_ratio
+        && score.imp_block_ratio >= pp.min_imp_ratio
+        && score.global_imp_block_ratio >= pp.min_global_imp_ratio
+        && score.avg_luma_8bit >= pp.min_luma_8bit
         && score
             .transient_similarity_score
-            .is_some_and(|delta| delta >= FAST_MOTION_MIN_TRANSIENT_DELTA_8BIT)
+            .is_some_and(|delta| delta >= pp.min_transient_delta_8bit)
 }
 
-fn strong_fast_motion_exit(score: ScenecutResult) -> bool {
-    score.decision == ScenecutDecision::Cut && score.cost_ratio >= FAST_MOTION_EXIT_MIN_COST_RATIO
+fn strong_fast_motion_exit(pp: &FastMotionTuning, score: ScenecutResult) -> bool {
+    score.decision == ScenecutDecision::Cut && score.cost_ratio >= pp.exit_min_cost_ratio
 }
 
-const DARK_OCCLUSION_MAX_COST_RATIO: f64 = 0.25;
-const DARK_OCCLUSION_MAX_LUMA_8BIT: f64 = 25.0;
-const DARK_OCCLUSION_MIN_IMP_RATIO: f64 = 3.5;
-const DARK_OCCLUSION_MIN_GLOBAL_IMP_RATIO: f64 = 4.5;
-const DARK_OCCLUSION_MIN_BAD_BLOCK_RATIO: f64 = 0.70;
-const DARK_OCCLUSION_MAX_GOOD_BLOCK_RATIO: f64 = 0.002;
-const DARK_OCCLUSION_MAX_TRANSIENT_DELTA_8BIT: f64 = 4.0;
+/// Ceiling on the `forward_similarity` candidate deltas `dark_occlusion_cut`
+/// may consume; pinned as a `const` (not a [`DarkOcclusionTuning`] field) for
+/// the same compile-time-assertion reason as
+/// [`TEXT_CARD_MAX_SIMILARITY_DELTA_8BIT`].
 const DARK_OCCLUSION_MAX_FORWARD_DELTA_8BIT: f64 = 5.0;
 
 fn apply_dark_occlusion_postprocess(
+    pp: &DarkOcclusionTuning,
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
 ) {
@@ -2893,7 +3020,10 @@ fn apply_dark_occlusion_postprocess(
         .filter(|&frame| frame != 0)
         .collect::<Vec<_>>();
     for frame in cuts {
-        let suppress = scores.get(&frame).copied().is_some_and(dark_occlusion_cut);
+        let suppress = scores
+            .get(&frame)
+            .copied()
+            .is_some_and(|score| dark_occlusion_cut(pp, score));
         if !suppress {
             continue;
         }
@@ -2904,17 +3034,17 @@ fn apply_dark_occlusion_postprocess(
     }
 }
 
-fn dark_occlusion_cut(score: ScenecutResult) -> bool {
+fn dark_occlusion_cut(pp: &DarkOcclusionTuning, score: ScenecutResult) -> bool {
     score.decision == ScenecutDecision::CutImportance
-        && score.cost_ratio <= DARK_OCCLUSION_MAX_COST_RATIO
-        && score.avg_luma_8bit <= DARK_OCCLUSION_MAX_LUMA_8BIT
-        && score.imp_block_ratio >= DARK_OCCLUSION_MIN_IMP_RATIO
-        && score.global_imp_block_ratio >= DARK_OCCLUSION_MIN_GLOBAL_IMP_RATIO
-        && score.static_bad_block_ratio >= DARK_OCCLUSION_MIN_BAD_BLOCK_RATIO
-        && score.static_good_block_ratio <= DARK_OCCLUSION_MAX_GOOD_BLOCK_RATIO
+        && score.cost_ratio <= pp.max_cost_ratio
+        && score.avg_luma_8bit <= pp.max_luma_8bit
+        && score.imp_block_ratio >= pp.min_imp_ratio
+        && score.global_imp_block_ratio >= pp.min_global_imp_ratio
+        && score.static_bad_block_ratio >= pp.min_bad_block_ratio
+        && score.static_good_block_ratio <= pp.max_good_block_ratio
         && score
             .transient_similarity_score
-            .is_some_and(|delta| delta <= DARK_OCCLUSION_MAX_TRANSIENT_DELTA_8BIT)
+            .is_some_and(|delta| delta <= pp.max_transient_delta_8bit)
         && score
             .forward_similarity_candidates
             .iter()
@@ -2922,54 +3052,13 @@ fn dark_occlusion_cut(score: ScenecutResult) -> bool {
             .any(|candidate| candidate.delta <= DARK_OCCLUSION_MAX_FORWARD_DELTA_8BIT)
 }
 
-const DARK_SCENE_PEAK_MIN_SCENE_LEN: usize = 120;
-const DARK_SCENE_PEAK_LOCAL_RADIUS: usize = 5;
-const DARK_SCENE_PEAK_DENSITY_RADIUS: usize = 500;
-const DARK_SCENE_PEAK_WIDE_DENSITY_RADIUS: usize = 2000;
-const DARK_SCENE_PEAK_MAX_LOCAL_CUTS: usize = 10;
-const DARK_SCENE_PEAK_MAX_WIDE_CUTS: usize = 35;
-const DARK_SCENE_PEAK_MAX_ADJACENT_COST_RATIO: f64 = 5.0;
-const DARK_SCENE_PEAK_MIN_COST_RATIO: f64 = 0.25;
-const DARK_SCENE_PEAK_MAX_COST_RATIO: f64 = 0.45;
-const DARK_SCENE_PEAK_MAX_LUMA_8BIT: f64 = 50.0;
-const DARK_SCENE_PEAK_MIN_IMP_RATIO: f64 = 1.3;
-const DARK_SCENE_PEAK_MIN_GLOBAL_IMP_RATIO: f64 = 1.4;
-const DARK_SCENE_PEAK_MIN_BAD_BLOCK_RATIO: f64 = 0.62;
-const DARK_SCENE_PEAK_MAX_GOOD_BLOCK_RATIO: f64 = 0.005;
-
-/// Shared gating parameters for the dark/sparse scene-peak recovery passes.
-///
-/// The two passes are line-for-line identical apart from these values, so they
-/// share a single parameterized implementation
-/// ([`apply_scene_peak_recovery_postprocess`] / [`scene_peak_recovery_candidate`]).
-struct ScenePeakRecoveryConfig {
-    min_scene_len: usize,
-    local_radius: usize,
-    density_radius: usize,
-    wide_density_radius: usize,
-    max_local_cuts: usize,
-    max_wide_cuts: usize,
-    max_adjacent_cost_ratio: f64,
-    /// Predicate deciding whether a frame's score qualifies for this pass.
-    score_fn: fn(ScenecutResult) -> bool,
-    /// Decision tag stamped onto recovered keyframes.
-    decision: ScenecutDecision,
-}
-
-const DARK_SCENE_PEAK_RECOVERY_CONFIG: ScenePeakRecoveryConfig = ScenePeakRecoveryConfig {
-    min_scene_len: DARK_SCENE_PEAK_MIN_SCENE_LEN,
-    local_radius: DARK_SCENE_PEAK_LOCAL_RADIUS,
-    density_radius: DARK_SCENE_PEAK_DENSITY_RADIUS,
-    wide_density_radius: DARK_SCENE_PEAK_WIDE_DENSITY_RADIUS,
-    max_local_cuts: DARK_SCENE_PEAK_MAX_LOCAL_CUTS,
-    max_wide_cuts: DARK_SCENE_PEAK_MAX_WIDE_CUTS,
-    max_adjacent_cost_ratio: DARK_SCENE_PEAK_MAX_ADJACENT_COST_RATIO,
-    score_fn: dark_scene_peak_score,
-    decision: ScenecutDecision::CutDarkScenePeak,
-};
-
+/// The dark/sparse scene-peak recovery passes are line-for-line identical
+/// apart from their [`ScenePeakGeometryTuning`] values, score predicate, and
+/// decision tag, so they share this parameterized implementation.
 fn apply_scene_peak_recovery_postprocess(
-    config: &ScenePeakRecoveryConfig,
+    geometry: &ScenePeakGeometryTuning,
+    decision: ScenecutDecision,
+    score_fn: impl Fn(ScenecutResult) -> bool,
     opts: DetectionOptions,
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
@@ -2978,8 +3067,16 @@ fn apply_scene_peak_recovery_postprocess(
     let candidates = scores
         .iter()
         .filter_map(|(&frame, &score)| {
-            scene_peak_recovery_candidate(config, frame, score, keyframes, scores, min_distance)
-                .then_some(frame)
+            scene_peak_recovery_candidate(
+                geometry,
+                &score_fn,
+                frame,
+                score,
+                keyframes,
+                scores,
+                min_distance,
+            )
+            .then_some(frame)
         })
         .collect::<Vec<_>>();
 
@@ -2989,13 +3086,14 @@ fn apply_scene_peak_recovery_postprocess(
         }
         keyframes.insert(frame);
         if let Some(score) = scores.get_mut(&frame) {
-            score.decision = config.decision;
+            score.decision = decision;
         }
     }
 }
 
 fn scene_peak_recovery_candidate(
-    config: &ScenePeakRecoveryConfig,
+    geometry: &ScenePeakGeometryTuning,
+    score_fn: impl Fn(ScenecutResult) -> bool,
     frame: usize,
     score: ScenecutResult,
     keyframes: &BTreeSet<usize>,
@@ -3005,11 +3103,12 @@ fn scene_peak_recovery_candidate(
     if score.decision != ScenecutDecision::NoCut {
         return false;
     }
-    if !(config.score_fn)(score) || !local_cost_peak(frame, scores, config.local_radius) {
+    if !score_fn(score) || !local_cost_peak(frame, scores, geometry.local_radius) {
         return false;
     }
-    if local_cut_count(keyframes, frame, config.density_radius) > config.max_local_cuts
-        || local_cut_count(keyframes, frame, config.wide_density_radius) > config.max_wide_cuts
+    if local_cut_count(keyframes, frame, geometry.density_radius) > geometry.max_local_cuts
+        || local_cut_count(keyframes, frame, geometry.wide_density_radius)
+            > geometry.max_wide_cuts
     {
         return false;
     }
@@ -3020,7 +3119,7 @@ fn scene_peak_recovery_candidate(
     let Some(next_cut) = keyframes.range((frame + 1)..).next().copied() else {
         return false;
     };
-    if next_cut - previous_cut < config.min_scene_len
+    if next_cut - previous_cut < geometry.min_scene_len
         || frame - previous_cut < min_distance
         || next_cut - frame < min_distance
     {
@@ -3031,8 +3130,8 @@ fn scene_peak_recovery_candidate(
         .get(&previous_cut)
         .map_or(0.0, |score| score.cost_ratio);
     let next_cost_ratio = scores.get(&next_cut).map_or(0.0, |score| score.cost_ratio);
-    previous_cost_ratio <= config.max_adjacent_cost_ratio
-        && next_cost_ratio <= config.max_adjacent_cost_ratio
+    previous_cost_ratio <= geometry.max_adjacent_cost_ratio
+        && next_cost_ratio <= geometry.max_adjacent_cost_ratio
 }
 
 fn apply_dark_scene_peak_recovery_postprocess(
@@ -3040,22 +3139,25 @@ fn apply_dark_scene_peak_recovery_postprocess(
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
 ) {
+    let pp = &opts.tuning.postprocess.dark_scene_peak;
     apply_scene_peak_recovery_postprocess(
-        &DARK_SCENE_PEAK_RECOVERY_CONFIG,
+        &pp.geometry,
+        ScenecutDecision::CutDarkScenePeak,
+        |score| dark_scene_peak_score(pp, score),
         opts,
         keyframes,
         scores,
     );
 }
 
-fn dark_scene_peak_score(score: ScenecutResult) -> bool {
-    score.cost_ratio >= DARK_SCENE_PEAK_MIN_COST_RATIO
-        && score.cost_ratio <= DARK_SCENE_PEAK_MAX_COST_RATIO
-        && score.avg_luma_8bit <= DARK_SCENE_PEAK_MAX_LUMA_8BIT
-        && score.imp_block_ratio >= DARK_SCENE_PEAK_MIN_IMP_RATIO
-        && score.global_imp_block_ratio >= DARK_SCENE_PEAK_MIN_GLOBAL_IMP_RATIO
-        && score.static_bad_block_ratio >= DARK_SCENE_PEAK_MIN_BAD_BLOCK_RATIO
-        && score.static_good_block_ratio <= DARK_SCENE_PEAK_MAX_GOOD_BLOCK_RATIO
+fn dark_scene_peak_score(pp: &DarkScenePeakTuning, score: ScenecutResult) -> bool {
+    score.cost_ratio >= pp.min_cost_ratio
+        && score.cost_ratio <= pp.max_cost_ratio
+        && score.avg_luma_8bit <= pp.max_luma_8bit
+        && score.imp_block_ratio >= pp.min_imp_ratio
+        && score.global_imp_block_ratio >= pp.min_global_imp_ratio
+        && score.static_bad_block_ratio >= pp.min_bad_block_ratio
+        && score.static_good_block_ratio <= pp.max_good_block_ratio
 }
 
 fn local_cost_peak(frame: usize, scores: &BTreeMap<usize, ScenecutResult>, radius: usize) -> bool {
@@ -3092,54 +3194,316 @@ fn scene_distance_ok(frame: usize, keyframes: &BTreeSet<usize>, min_distance: us
     previous_ok && next_ok
 }
 
-const SPARSE_SCENE_PEAK_MIN_SCENE_LEN: usize = 120;
-const SPARSE_SCENE_PEAK_LOCAL_RADIUS: usize = 5;
-const SPARSE_SCENE_PEAK_DENSITY_RADIUS: usize = 500;
-const SPARSE_SCENE_PEAK_WIDE_DENSITY_RADIUS: usize = 2000;
-const SPARSE_SCENE_PEAK_MAX_LOCAL_CUTS: usize = 10;
-const SPARSE_SCENE_PEAK_MAX_WIDE_CUTS: usize = 35;
-const SPARSE_SCENE_PEAK_MAX_ADJACENT_COST_RATIO: f64 = 5.0;
-const SPARSE_SCENE_PEAK_MIN_COST_RATIO: f64 = 0.25;
-const SPARSE_SCENE_PEAK_MAX_COST_RATIO: f64 = 1.0;
-const SPARSE_SCENE_PEAK_MIN_IMP_RATIO: f64 = 1.5;
-const SPARSE_SCENE_PEAK_MIN_GLOBAL_IMP_RATIO: f64 = 1.8;
-const SPARSE_SCENE_PEAK_MAX_LUMA_8BIT: f64 = 90.0;
-const SPARSE_SCENE_PEAK_MIN_BAD_BLOCK_RATIO: f64 = 0.60;
-const SPARSE_SCENE_PEAK_MAX_GOOD_BLOCK_RATIO: f64 = 0.10;
-
-const SPARSE_SCENE_PEAK_RECOVERY_CONFIG: ScenePeakRecoveryConfig = ScenePeakRecoveryConfig {
-    min_scene_len: SPARSE_SCENE_PEAK_MIN_SCENE_LEN,
-    local_radius: SPARSE_SCENE_PEAK_LOCAL_RADIUS,
-    density_radius: SPARSE_SCENE_PEAK_DENSITY_RADIUS,
-    wide_density_radius: SPARSE_SCENE_PEAK_WIDE_DENSITY_RADIUS,
-    max_local_cuts: SPARSE_SCENE_PEAK_MAX_LOCAL_CUTS,
-    max_wide_cuts: SPARSE_SCENE_PEAK_MAX_WIDE_CUTS,
-    max_adjacent_cost_ratio: SPARSE_SCENE_PEAK_MAX_ADJACENT_COST_RATIO,
-    score_fn: sparse_scene_peak_score,
-    decision: ScenecutDecision::CutSparseScenePeak,
-};
-
 fn apply_sparse_scene_peak_recovery_postprocess(
     opts: DetectionOptions,
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
 ) {
+    let pp = &opts.tuning.postprocess.sparse_scene_peak;
     apply_scene_peak_recovery_postprocess(
-        &SPARSE_SCENE_PEAK_RECOVERY_CONFIG,
+        &pp.geometry,
+        ScenecutDecision::CutSparseScenePeak,
+        |score| sparse_scene_peak_score(pp, score),
         opts,
         keyframes,
         scores,
     );
 }
 
-fn sparse_scene_peak_score(score: ScenecutResult) -> bool {
-    score.cost_ratio >= SPARSE_SCENE_PEAK_MIN_COST_RATIO
-        && score.cost_ratio <= SPARSE_SCENE_PEAK_MAX_COST_RATIO
-        && score.imp_block_ratio >= SPARSE_SCENE_PEAK_MIN_IMP_RATIO
-        && score.global_imp_block_ratio >= SPARSE_SCENE_PEAK_MIN_GLOBAL_IMP_RATIO
-        && score.avg_luma_8bit <= SPARSE_SCENE_PEAK_MAX_LUMA_8BIT
-        && score.static_bad_block_ratio >= SPARSE_SCENE_PEAK_MIN_BAD_BLOCK_RATIO
-        && score.static_good_block_ratio <= SPARSE_SCENE_PEAK_MAX_GOOD_BLOCK_RATIO
+fn sparse_scene_peak_score(pp: &SparseScenePeakTuning, score: ScenecutResult) -> bool {
+    score.cost_ratio >= pp.min_cost_ratio
+        && score.cost_ratio <= pp.max_cost_ratio
+        && score.imp_block_ratio >= pp.min_imp_ratio
+        && score.global_imp_block_ratio >= pp.min_global_imp_ratio
+        && score.avg_luma_8bit <= pp.max_luma_8bit
+        && score.static_bad_block_ratio >= pp.min_bad_block_ratio
+        && score.static_good_block_ratio <= pp.max_good_block_ratio
+}
+
+/// Recovers cuts in smooth low-texture scenes (fog, haze, gradients) where the
+/// absolute importance metric never reaches the main cut thresholds, but the
+/// cut frame is a sharp local outlier: its importance cost spikes several
+/// times above both its immediate neighbors and the local window median while
+/// carrying real forward and backward cost. A luma-delta gate rejects global
+/// flashes (which also spike, but shift the frame's average brightness), and
+/// cut-density gates keep the pass out of rapidly-cut material where local
+/// statistics are meaningless.
+fn apply_local_peak_recovery_postprocess(
+    pp: &LocalPeakRecoveryTuning,
+    opts: DetectionOptions,
+    keyframes: &mut BTreeSet<usize>,
+    scores: &mut BTreeMap<usize, ScenecutResult>,
+) {
+    let min_distance = opts
+        .min_scenecut_distance
+        .unwrap_or(0)
+        .max(pp.min_distance_to_cut);
+    let candidates = scores
+        .iter()
+        .filter_map(|(&frame, &score)| {
+            local_peak_recovery_candidate(pp, frame, score, keyframes, scores, min_distance)
+                .then_some(frame)
+        })
+        .collect::<Vec<_>>();
+
+    // Ascending insertion + a distance recheck collapses candidate runs to
+    // their earliest member: echo peaks trail the true boundary.
+    for frame in candidates {
+        if !scene_distance_ok(frame, keyframes, min_distance) {
+            continue;
+        }
+        keyframes.insert(frame);
+        if let Some(score) = scores.get_mut(&frame) {
+            score.decision = ScenecutDecision::CutLocalPeak;
+        }
+    }
+}
+
+/// Counts distinct comparable-peak events around `frame`: frames whose
+/// importance cost reaches `trigger`, with consecutive triggers closer than
+/// `merge_gap` merged into one event. Rhythmic content (letter morphs every
+/// few frames, lightning shimmer) produces several separate spikes; a real
+/// isolated cut's only company is an echo or one broad motion swell.
+fn strobe_event_count(
+    scores: &BTreeMap<usize, ScenecutResult>,
+    frame: usize,
+    trigger: f64,
+    radius: usize,
+    merge_gap: usize,
+) -> usize {
+    let start = frame.saturating_sub(radius);
+    let end = frame.saturating_add(radius);
+    let mut events = 0usize;
+    let mut previous_trigger: Option<usize> = None;
+    for (&other_frame, other) in scores.range(start..=end) {
+        if other_frame.abs_diff(frame) <= 1 || other.imp_block_cost < trigger {
+            continue;
+        }
+        if previous_trigger.is_none_or(|previous| other_frame - previous > merge_gap) {
+            events += 1;
+        }
+        previous_trigger = Some(other_frame);
+    }
+    events
+}
+
+/// Mean absolute delta of the two frames' mean-normalized luma signatures:
+/// the change in spatial light *distribution*, insensitive to global
+/// brightness scaling (flicker, flashes). `None` when either signature is
+/// missing or too dark to normalize.
+fn normalized_signature_delta(a: &ScenecutResult, b: &ScenecutResult) -> Option<f64> {
+    let sig_a = a.frame_luma_signature?;
+    let sig_b = b.frame_luma_signature?;
+    let mean_a = sig_a.iter().map(|&v| f64::from(v)).sum::<f64>() / sig_a.len() as f64;
+    let mean_b = sig_b.iter().map(|&v| f64::from(v)).sum::<f64>() / sig_b.len() as f64;
+    if mean_a <= 2.0 || mean_b <= 2.0 {
+        return None;
+    }
+    let delta = sig_a
+        .iter()
+        .zip(sig_b.iter())
+        .map(|(&x, &y)| (f64::from(x) / mean_a - f64::from(y) / mean_b).abs())
+        .sum::<f64>()
+        / sig_a.len() as f64;
+    Some(delta)
+}
+
+/// Recovers cuts wrongly vetoed by the importance-cut good-block gate. In
+/// dark low-texture material flat blocks "match" across a real cut and
+/// inflate the good ratio past the gate, while the mean-normalized luma
+/// signature — the spatial *composition* of light — clearly moves. Flicker
+/// and flashes scale brightness without moving the composition, so a large
+/// normalized delta re-admits real cuts only.
+fn apply_signature_rescue_postprocess(
+    pp: &SignatureRescueTuning,
+    opts: DetectionOptions,
+    keyframes: &mut BTreeSet<usize>,
+    scores: &mut BTreeMap<usize, ScenecutResult>,
+) {
+    let min_distance = opts
+        .min_scenecut_distance
+        .unwrap_or(0)
+        .max(pp.min_distance_to_cut);
+    let candidates = scores
+        .iter()
+        .filter_map(|(&frame, &score)| {
+            signature_rescue_candidate(pp, frame, score, keyframes, scores, min_distance)
+                .then_some(frame)
+        })
+        .collect::<Vec<_>>();
+
+    for frame in candidates {
+        if !scene_distance_ok(frame, keyframes, min_distance) {
+            continue;
+        }
+        keyframes.insert(frame);
+        if let Some(score) = scores.get_mut(&frame) {
+            score.decision = ScenecutDecision::CutSignatureRescue;
+        }
+    }
+}
+
+fn signature_rescue_candidate(
+    pp: &SignatureRescueTuning,
+    frame: usize,
+    score: ScenecutResult,
+    keyframes: &BTreeSet<usize>,
+    scores: &BTreeMap<usize, ScenecutResult>,
+    min_distance: usize,
+) -> bool {
+    // Good-gate victims end as plain NoCut with a good ratio past the gate
+    // threshold; anything else was rejected (or suppressed) for other reasons.
+    if score.decision != ScenecutDecision::NoCut {
+        return false;
+    }
+    if score.imp_block_ratio < pp.min_imp_ratio
+        || score.cost_ratio < pp.min_cost_ratio
+        || score.cost_ratio >= pp.max_cost_ratio
+        || score.static_good_block_ratio <= pp.min_good_block_ratio
+        || score.static_good_block_ratio > pp.max_good_block_ratio
+    {
+        return false;
+    }
+
+    let Some(previous_score) = frame
+        .checked_sub(1)
+        .and_then(|previous| scores.get(&previous))
+    else {
+        return false;
+    };
+    let Some(delta) = normalized_signature_delta(&score, previous_score) else {
+        return false;
+    };
+    if delta < pp.min_norm_signature_delta {
+        return false;
+    }
+
+    // Structure gate: a partial flash / brief occlusion moves the light
+    // composition (large signature delta) while most structure-bearing
+    // blocks still correlate; a real cut decorrelates them.
+    if score.structure_coverage >= pp.min_structure_coverage
+        && score.structure_match_ratio >= pp.max_structure_match_ratio
+    {
+        return false;
+    }
+
+    if strobe_event_count(
+        scores,
+        frame,
+        pp.strobe_trigger_ratio * score.imp_block_cost,
+        pp.strobe_radius,
+        pp.strobe_merge_gap,
+    ) > pp.max_strobe_events
+    {
+        return false;
+    }
+
+    if !scene_distance_ok(frame, keyframes, min_distance) {
+        return false;
+    }
+    local_cut_count(keyframes, frame, pp.density_radius) <= pp.max_local_cuts
+        && local_cut_count(keyframes, frame, pp.wide_density_radius) <= pp.max_wide_cuts
+}
+
+fn local_peak_recovery_candidate(
+    pp: &LocalPeakRecoveryTuning,
+    frame: usize,
+    score: ScenecutResult,
+    keyframes: &BTreeSet<usize>,
+    scores: &BTreeMap<usize, ScenecutResult>,
+    min_distance: usize,
+) -> bool {
+    // Unlike the sparse/dark peak passes this also accepts frames the
+    // importance or transient-similarity vetoes rejected: both misfire in
+    // fog scenes (tiny absolute costs; signatures that all look alike). The
+    // luma-delta gate below still rejects the flashes those vetoes exist for.
+    // Deliberate suppressions with stronger evidence (forward similarity,
+    // fast motion, occlusion, ...) stay untouched.
+    if !matches!(
+        score.decision,
+        ScenecutDecision::NoCut
+            | ScenecutDecision::SuppressedImportance
+            | ScenecutDecision::SuppressedTransientSimilarity
+    ) {
+        return false;
+    }
+    if score.imp_block_ratio < pp.min_imp_ratio
+        || score.cost_ratio < pp.min_cost_ratio
+        || score.backward_adjusted_cost < pp.min_backward_cost_ratio * score.threshold
+        || score.static_good_block_ratio > pp.max_good_block_ratio
+    {
+        return false;
+    }
+
+    // Flash guard: fog cuts barely move the average luma, flashes jump it.
+    let Some(previous_score) = frame
+        .checked_sub(1)
+        .and_then(|previous| scores.get(&previous))
+    else {
+        return false;
+    };
+    if (score.avg_luma_8bit - previous_score.avg_luma_8bit).abs() > pp.max_luma_delta_8bit {
+        return false;
+    }
+
+    // Sharpness: the peak must dwarf both immediate neighbors...
+    let neighbor_max = previous_score.imp_block_cost.max(
+        scores
+            .get(&(frame + 1))
+            .map_or(f64::NEG_INFINITY, |next| next.imp_block_cost),
+    );
+    if !neighbor_max.is_finite()
+        || score.imp_block_cost < pp.min_peak_over_neighbors * neighbor_max
+    {
+        return false;
+    }
+
+    // ...and the local median (excluding the peak and its neighbors).
+    let start = frame.saturating_sub(pp.median_window_radius);
+    let end = frame.saturating_add(pp.median_window_radius);
+    let mut window = scores
+        .range(start..=end)
+        .filter(|&(&other_frame, _)| other_frame.abs_diff(frame) > 1)
+        .map(|(_, other)| other.imp_block_cost)
+        .collect::<Vec<_>>();
+    if window.len() < pp.min_median_samples {
+        return false;
+    }
+    // True median (averaging the two middles for even lengths): fog windows
+    // are bimodal (quiet frames + a motion swell filling near half the
+    // window), so the upper-middle element alone can land on the swell side
+    // and overstate the baseline severalfold.
+    let window_len = window.len();
+    let mid = window_len / 2;
+    let (below, upper_middle, _) =
+        window.select_nth_unstable_by(mid, |a, b| a.partial_cmp(b).expect("costs are finite"));
+    let upper_middle = *upper_middle;
+    let median = if window_len % 2 == 0 {
+        let lower_middle = below.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        (lower_middle + upper_middle) / 2.0
+    } else {
+        upper_middle
+    };
+    if median <= 0.0 || score.imp_block_cost < pp.min_peak_over_median * median {
+        return false;
+    }
+
+    if strobe_event_count(
+        scores,
+        frame,
+        pp.strobe_trigger_ratio * score.imp_block_cost,
+        pp.strobe_radius,
+        pp.strobe_merge_gap,
+    ) > pp.max_strobe_events
+    {
+        return false;
+    }
+
+    if !scene_distance_ok(frame, keyframes, min_distance) {
+        return false;
+    }
+    local_cut_count(keyframes, frame, pp.density_radius) <= pp.max_local_cuts
+        && local_cut_count(keyframes, frame, pp.wide_density_radius) <= pp.max_wide_cuts
 }
 
 #[derive(Clone, Copy)]
@@ -3148,38 +3512,19 @@ struct RefinedSparsePeakShift {
     to: usize,
 }
 
-const REFINED_SPARSE_PEAK_MIN_DISTANCE: usize = 40;
-const REFINED_SPARSE_PEAK_SHIFT_MAX_DISTANCE: usize = 40;
-const REFINED_SPARSE_PEAK_MIN_COST_RATIO: f64 = 0.65;
-const REFINED_SPARSE_PEAK_MAX_COST_RATIO: f64 = 1.05;
-const REFINED_SPARSE_PEAK_MIN_IMP_RATIO: f64 = 3.0;
-const REFINED_SPARSE_PEAK_MIN_GLOBAL_IMP_RATIO: f64 = 3.5;
-const REFINED_SPARSE_PEAK_MIN_LUMA_8BIT: f64 = 55.0;
-const REFINED_SPARSE_PEAK_MAX_LUMA_8BIT: f64 = 90.0;
-const REFINED_SPARSE_PEAK_MIN_BAD_BLOCK_RATIO: f64 = 0.50;
-const REFINED_SPARSE_PEAK_MAX_GOOD_BLOCK_RATIO: f64 = 0.09;
-const REFINED_SPARSE_PEAK_MIN_EDGE_DELTA_8BIT: f64 = 10.0;
-const REFINED_SPARSE_PEAK_MAX_REPEAT_DELTA_8BIT: f64 = 5.0;
-const REFINED_SPARSE_PEAK_MIN_DISTINCT_DELTA_8BIT: f64 = 8.0;
-const REFINED_SPARSE_PEAK_DENSITY_RADIUS: usize = 500;
-const REFINED_SPARSE_PEAK_WIDE_DENSITY_RADIUS: usize = 2000;
-const REFINED_SPARSE_PEAK_MAX_LOCAL_CUTS: usize = 12;
-const REFINED_SPARSE_PEAK_MAX_WIDE_CUTS: usize = 40;
-const REFINED_SPARSE_PEAK_MAX_ADJACENT_COST_RATIO: f64 = 5.0;
-const REFINED_SPARSE_PEAK_ABA_MAX_SEGMENT_LEN: usize = 130;
-
 fn apply_refined_sparse_peak_postprocess(
     opts: DetectionOptions,
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
 ) {
+    let pp = &opts.tuning.postprocess;
     let min_distance = opts
         .min_scenecut_distance
         .unwrap_or(0)
-        .max(REFINED_SPARSE_PEAK_MIN_DISTANCE);
+        .max(pp.refined_sparse_peak.min_distance);
     let base_min_distance = opts.min_scenecut_distance.unwrap_or(0);
 
-    let shifts = refined_sparse_peak_shifts(base_min_distance, keyframes, scores);
+    let shifts = refined_sparse_peak_shifts(pp, base_min_distance, keyframes, scores);
     let shifted_to = shifts.iter().map(|shift| shift.to).collect::<BTreeSet<_>>();
     for shift in shifts {
         keyframes.remove(&shift.from);
@@ -3195,8 +3540,15 @@ fn apply_refined_sparse_peak_postprocess(
     let candidates = scores
         .iter()
         .filter_map(|(&frame, &score)| {
-            refined_sparse_peak_recovery_candidate(frame, score, keyframes, scores, min_distance)
-                .then_some(frame)
+            refined_sparse_peak_recovery_candidate(
+                pp,
+                frame,
+                score,
+                keyframes,
+                scores,
+                min_distance,
+            )
+            .then_some(frame)
         })
         .collect::<Vec<_>>();
 
@@ -3213,6 +3565,7 @@ fn apply_refined_sparse_peak_postprocess(
     }
 
     let suppress = refined_sparse_peak_aba_suppressions(
+        pp,
         base_min_distance,
         min_distance,
         keyframes,
@@ -3228,10 +3581,12 @@ fn apply_refined_sparse_peak_postprocess(
 }
 
 fn refined_sparse_peak_shifts(
+    pp: &PostprocessTuning,
     min_distance: usize,
     keyframes: &BTreeSet<usize>,
     scores: &BTreeMap<usize, ScenecutResult>,
 ) -> Vec<RefinedSparsePeakShift> {
+    let refined = &pp.refined_sparse_peak;
     let min_distance = min_distance.max(1);
     keyframes
         .iter()
@@ -3244,20 +3599,20 @@ fn refined_sparse_peak_shifts(
             let next_cut = keyframes.range((frame + 1)..).next().copied()?;
             let next_next_cut = keyframes.range((next_cut + 1)..).next().copied()?;
             if frame_signature_delta_for_scores(frame, next_next_cut, scores)?
-                > REFINED_SPARSE_PEAK_MAX_REPEAT_DELTA_8BIT
+                > refined.max_repeat_delta_8bit
             {
                 return None;
             }
 
             let search_end = frame
-                .saturating_add(REFINED_SPARSE_PEAK_SHIFT_MAX_DISTANCE)
+                .saturating_add(refined.shift_max_distance)
                 .min(next_cut.saturating_sub(min_distance));
             ((frame + min_distance)..=search_end)
                 .filter(|&candidate| {
                     let Some(candidate_score) = scores.get(&candidate).copied() else {
                         return false;
                     };
-                    if !refined_sparse_peak_score(candidate, candidate_score, scores) {
+                    if !refined_sparse_peak_score(pp, candidate, candidate_score, scores) {
                         return false;
                     }
                     let Some(candidate_next_next_delta) =
@@ -3270,8 +3625,8 @@ fn refined_sparse_peak_shifts(
                     else {
                         return false;
                     };
-                    candidate_next_next_delta > REFINED_SPARSE_PEAK_MIN_DISTINCT_DELTA_8BIT
-                        && candidate_from_delta >= REFINED_SPARSE_PEAK_MIN_DISTINCT_DELTA_8BIT
+                    candidate_next_next_delta > refined.min_distinct_delta_8bit
+                        && candidate_from_delta >= refined.min_distinct_delta_8bit
                 })
                 .max_by(|&left, &right| {
                     refined_sparse_peak_rank(left, scores)
@@ -3284,19 +3639,20 @@ fn refined_sparse_peak_shifts(
 }
 
 fn refined_sparse_peak_recovery_candidate(
+    pp: &PostprocessTuning,
     frame: usize,
     score: ScenecutResult,
     keyframes: &BTreeSet<usize>,
     scores: &BTreeMap<usize, ScenecutResult>,
     min_distance: usize,
 ) -> bool {
-    if keyframes.contains(&frame) || !refined_sparse_peak_score(frame, score, scores) {
+    let refined = &pp.refined_sparse_peak;
+    if keyframes.contains(&frame) || !refined_sparse_peak_score(pp, frame, score, scores) {
         return false;
     }
-    if local_cut_count(keyframes, frame, REFINED_SPARSE_PEAK_DENSITY_RADIUS)
-        > REFINED_SPARSE_PEAK_MAX_LOCAL_CUTS
-        || local_cut_count(keyframes, frame, REFINED_SPARSE_PEAK_WIDE_DENSITY_RADIUS)
-            > REFINED_SPARSE_PEAK_MAX_WIDE_CUTS
+    if local_cut_count(keyframes, frame, refined.density_radius) > refined.max_local_cuts
+        || local_cut_count(keyframes, frame, refined.wide_density_radius)
+            > refined.max_wide_cuts
     {
         return false;
     }
@@ -3307,10 +3663,10 @@ fn refined_sparse_peak_recovery_candidate(
     let Some(next_cut) = keyframes.range((frame + 1)..).next().copied() else {
         return false;
     };
-    if next_cut - previous_cut < SPARSE_SCENE_PEAK_MIN_SCENE_LEN
+    if next_cut - previous_cut < pp.sparse_scene_peak.geometry.min_scene_len
         || frame - previous_cut < min_distance
         || next_cut - frame < min_distance
-        || refined_sparse_repeat_context(previous_cut, frame, next_cut, scores)
+        || refined_sparse_repeat_context(refined, previous_cut, frame, next_cut, scores)
     {
         return false;
     }
@@ -3319,27 +3675,29 @@ fn refined_sparse_peak_recovery_candidate(
         .get(&previous_cut)
         .map_or(0.0, |score| score.cost_ratio);
     let next_cost_ratio = scores.get(&next_cut).map_or(0.0, |score| score.cost_ratio);
-    previous_cost_ratio <= REFINED_SPARSE_PEAK_MAX_ADJACENT_COST_RATIO
-        && next_cost_ratio <= REFINED_SPARSE_PEAK_MAX_ADJACENT_COST_RATIO
+    previous_cost_ratio <= refined.max_adjacent_cost_ratio
+        && next_cost_ratio <= refined.max_adjacent_cost_ratio
 }
 
 fn refined_sparse_peak_score(
+    pp: &PostprocessTuning,
     frame: usize,
     score: ScenecutResult,
     scores: &BTreeMap<usize, ScenecutResult>,
 ) -> bool {
+    let refined = &pp.refined_sparse_peak;
     score.decision == ScenecutDecision::NoCut
-        && score.cost_ratio >= REFINED_SPARSE_PEAK_MIN_COST_RATIO
-        && score.cost_ratio <= REFINED_SPARSE_PEAK_MAX_COST_RATIO
-        && score.imp_block_ratio >= REFINED_SPARSE_PEAK_MIN_IMP_RATIO
-        && score.global_imp_block_ratio >= REFINED_SPARSE_PEAK_MIN_GLOBAL_IMP_RATIO
-        && score.avg_luma_8bit >= REFINED_SPARSE_PEAK_MIN_LUMA_8BIT
-        && score.avg_luma_8bit <= REFINED_SPARSE_PEAK_MAX_LUMA_8BIT
-        && score.static_bad_block_ratio >= REFINED_SPARSE_PEAK_MIN_BAD_BLOCK_RATIO
-        && score.static_good_block_ratio <= REFINED_SPARSE_PEAK_MAX_GOOD_BLOCK_RATIO
+        && score.cost_ratio >= refined.min_cost_ratio
+        && score.cost_ratio <= refined.max_cost_ratio
+        && score.imp_block_ratio >= refined.min_imp_ratio
+        && score.global_imp_block_ratio >= refined.min_global_imp_ratio
+        && score.avg_luma_8bit >= refined.min_luma_8bit
+        && score.avg_luma_8bit <= refined.max_luma_8bit
+        && score.static_bad_block_ratio >= refined.min_bad_block_ratio
+        && score.static_good_block_ratio <= refined.max_good_block_ratio
         && frame_signature_delta_for_scores(frame.saturating_sub(1), frame, scores)
-            .is_some_and(|delta| delta >= REFINED_SPARSE_PEAK_MIN_EDGE_DELTA_8BIT)
-        && local_cost_peak(frame, scores, SPARSE_SCENE_PEAK_LOCAL_RADIUS)
+            .is_some_and(|delta| delta >= refined.min_edge_delta_8bit)
+        && local_cost_peak(frame, scores, pp.sparse_scene_peak.geometry.local_radius)
 }
 
 fn refined_sparse_peak_rank(frame: usize, scores: &BTreeMap<usize, ScenecutResult>) -> f64 {
@@ -3349,6 +3707,7 @@ fn refined_sparse_peak_rank(frame: usize, scores: &BTreeMap<usize, ScenecutResul
 }
 
 fn refined_sparse_repeat_context(
+    refined: &RefinedSparsePeakTuning,
     previous_cut: usize,
     frame: usize,
     next_cut: usize,
@@ -3361,16 +3720,18 @@ fn refined_sparse_repeat_context(
     ]
     .into_iter()
     .flatten()
-    .any(|delta| delta <= REFINED_SPARSE_PEAK_MAX_REPEAT_DELTA_8BIT)
+    .any(|delta| delta <= refined.max_repeat_delta_8bit)
 }
 
 fn refined_sparse_peak_aba_suppressions(
+    pp: &PostprocessTuning,
     base_min_distance: usize,
     min_distance: usize,
     keyframes: &BTreeSet<usize>,
     scores: &BTreeMap<usize, ScenecutResult>,
     recovered: &BTreeSet<usize>,
 ) -> Vec<usize> {
+    let aba_max_segment_len = pp.refined_sparse_peak.aba_max_segment_len;
     keyframes
         .iter()
         .copied()
@@ -3385,14 +3746,14 @@ fn refined_sparse_peak_aba_suppressions(
                 return false;
             };
             if !recovered.contains(&previous_cut)
-                || frame - previous_cut > REFINED_SPARSE_PEAK_ABA_MAX_SEGMENT_LEN
+                || frame - previous_cut > aba_max_segment_len
             {
                 return false;
             }
             let Some(next_cut) = keyframes.range((frame + 1)..).next().copied() else {
                 return false;
             };
-            if next_cut - frame > REFINED_SPARSE_PEAK_ABA_MAX_SEGMENT_LEN {
+            if next_cut - frame > aba_max_segment_len {
                 return false;
             }
 
@@ -3405,7 +3766,7 @@ fn refined_sparse_peak_aba_suppressions(
                             .get(&candidate)
                             .copied()
                             .is_some_and(|candidate_score| {
-                                refined_sparse_peak_score(candidate, candidate_score, scores)
+                                refined_sparse_peak_score(pp, candidate, candidate_score, scores)
                             })
                 })
         })
@@ -3433,26 +3794,17 @@ struct AbaReturnCandidate {
     previous_edge_delta: f64,
 }
 
-const ABA_RETURN_MIN_COST_RATIO: f64 = 0.25;
-const ABA_RETURN_MAX_COST_RATIO: f64 = 1.05;
-const ABA_RETURN_MIN_IMP_RATIO: f64 = 2.0;
-const ABA_RETURN_MIN_GLOBAL_IMP_RATIO: f64 = 3.0;
-const ABA_RETURN_MAX_LUMA_8BIT: f64 = 90.0;
-const ABA_RETURN_MAX_GOOD_BLOCK_RATIO: f64 = 0.10;
-const ABA_RETURN_MAX_SIGNATURE_DELTA_8BIT: f64 = 4.0;
-const ABA_RETURN_MIN_EDGE_DELTA_8BIT: f64 = 5.0;
-const ABA_RETURN_MIN_EDGE_RATIO: f64 = 2.0;
-
 fn apply_aba_return_recovery_postprocess(
     opts: DetectionOptions,
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
 ) {
+    let pp = &opts.tuning.postprocess.aba_return;
     let min_distance = opts.min_scenecut_distance.unwrap_or(0);
     let mut candidates = scores
         .iter()
         .filter_map(|(&frame, &score)| {
-            aba_return_recovery_candidate(frame, score, keyframes, scores, min_distance)
+            aba_return_recovery_candidate(pp, frame, score, keyframes, scores, min_distance)
         })
         .collect::<Vec<_>>();
 
@@ -3495,13 +3847,14 @@ fn apply_aba_return_recovery_postprocess(
 }
 
 fn aba_return_recovery_candidate(
+    pp: &AbaReturnTuning,
     frame: usize,
     score: ScenecutResult,
     keyframes: &BTreeSet<usize>,
     scores: &BTreeMap<usize, ScenecutResult>,
     min_distance: usize,
 ) -> Option<AbaReturnCandidate> {
-    if keyframes.contains(&frame) || !aba_return_score(score) {
+    if keyframes.contains(&frame) || !aba_return_score(pp, score) {
         return None;
     }
     let previous_cut = keyframes.range(..frame).next_back().copied()?;
@@ -3525,10 +3878,10 @@ fn aba_return_recovery_candidate(
     let previous_edge_delta = frame_signature_delta_8bit(previous_end, previous_start);
     let edge_ratio = edge_delta.min(previous_edge_delta) / return_delta.max(0.001);
 
-    if return_delta > ABA_RETURN_MAX_SIGNATURE_DELTA_8BIT
-        || edge_delta < ABA_RETURN_MIN_EDGE_DELTA_8BIT
-        || previous_edge_delta < ABA_RETURN_MIN_EDGE_DELTA_8BIT
-        || edge_ratio < ABA_RETURN_MIN_EDGE_RATIO
+    if return_delta > pp.max_signature_delta_8bit
+        || edge_delta < pp.min_edge_delta_8bit
+        || previous_edge_delta < pp.min_edge_delta_8bit
+        || edge_ratio < pp.min_edge_ratio
     {
         return None;
     }
@@ -3543,16 +3896,16 @@ fn aba_return_recovery_candidate(
     })
 }
 
-fn aba_return_score(score: ScenecutResult) -> bool {
+fn aba_return_score(pp: &AbaReturnTuning, score: ScenecutResult) -> bool {
     matches!(
         score.decision,
         ScenecutDecision::NoCut | ScenecutDecision::SuppressedTransientSimilarity
-    ) && score.cost_ratio >= ABA_RETURN_MIN_COST_RATIO
-        && score.cost_ratio <= ABA_RETURN_MAX_COST_RATIO
-        && score.imp_block_ratio >= ABA_RETURN_MIN_IMP_RATIO
-        && score.global_imp_block_ratio >= ABA_RETURN_MIN_GLOBAL_IMP_RATIO
-        && score.avg_luma_8bit <= ABA_RETURN_MAX_LUMA_8BIT
-        && score.static_good_block_ratio <= ABA_RETURN_MAX_GOOD_BLOCK_RATIO
+    ) && score.cost_ratio >= pp.min_cost_ratio
+        && score.cost_ratio <= pp.max_cost_ratio
+        && score.imp_block_ratio >= pp.min_imp_ratio
+        && score.global_imp_block_ratio >= pp.min_global_imp_ratio
+        && score.avg_luma_8bit <= pp.max_luma_8bit
+        && score.static_good_block_ratio <= pp.max_good_block_ratio
 }
 
 fn frame_signature_delta_8bit(
@@ -3572,32 +3925,22 @@ struct AbaChainCandidate {
     suppress: Vec<usize>,
 }
 
-const ABA_CHAIN_MIN_SEGMENTS: usize = 4;
-const ABA_CHAIN_MAX_SIGNATURE_DELTA_8BIT: f64 = 5.0;
-const ABA_CHAIN_MIN_DIFFERENT_DELTA_8BIT: f64 = 8.0;
-const ABA_CHAIN_MAX_SEGMENT_EXTRA: usize = 50;
-const ABA_CHAIN_MIN_HIDDEN_COST_RATIO: f64 = 0.25;
-const ABA_CHAIN_MAX_HIDDEN_COST_RATIO: f64 = 1.2;
-const ABA_CHAIN_MIN_HIDDEN_IMP_RATIO: f64 = 2.0;
-const ABA_CHAIN_MIN_HIDDEN_GLOBAL_IMP_RATIO: f64 = 3.0;
-const ABA_CHAIN_MAX_HIDDEN_LUMA_8BIT: f64 = 95.0;
-const ABA_CHAIN_MAX_HIDDEN_GOOD_BLOCK_RATIO: f64 = 0.12;
-const ABA_CHAIN_MIN_HIDDEN_EDGE_DELTA_8BIT: f64 = 5.0;
-
 fn apply_aba_chain_compaction_postprocess(
     opts: DetectionOptions,
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
 ) {
+    let pp = &opts.tuning.postprocess.aba_chain;
     let break_segment_len = opts.tuning.forward_similarity.frames.max(1);
     let max_segment_len = break_segment_len
         .saturating_add(break_segment_len / 2)
-        .saturating_add(ABA_CHAIN_MAX_SEGMENT_EXTRA.min(break_segment_len));
-    let boundaries = aba_chain_boundaries(keyframes, scores);
+        .saturating_add(pp.max_segment_extra.min(break_segment_len));
+    let boundaries = aba_chain_boundaries(pp, keyframes, scores);
     let mut chains = Vec::new();
 
     for start_idx in 0..boundaries.len().saturating_sub(2) {
         if let Some(chain) = aba_chain_from_boundary(
+            pp,
             start_idx,
             &boundaries,
             keyframes,
@@ -3636,6 +3979,7 @@ fn apply_aba_chain_compaction_postprocess(
 }
 
 fn aba_chain_boundaries(
+    pp: &AbaChainTuning,
     keyframes: &BTreeSet<usize>,
     scores: &BTreeMap<usize, ScenecutResult>,
 ) -> Vec<usize> {
@@ -3644,7 +3988,7 @@ fn aba_chain_boundaries(
         .copied()
         .filter(|&frame| frame != 0)
         .chain(scores.iter().filter_map(|(&frame, &score)| {
-            aba_chain_hidden_boundary(frame, score, keyframes, scores).then_some(frame)
+            aba_chain_hidden_boundary(pp, frame, score, keyframes, scores).then_some(frame)
         }))
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -3652,6 +3996,7 @@ fn aba_chain_boundaries(
 }
 
 fn aba_chain_from_boundary(
+    pp: &AbaChainTuning,
     start_idx: usize,
     boundaries: &[usize],
     keyframes: &BTreeSet<usize>,
@@ -3662,7 +4007,7 @@ fn aba_chain_from_boundary(
     let first = boundaries[start_idx];
     let second = boundaries.get(start_idx + 1).copied()?;
     if second - first > max_segment_len
-        || frame_signature_delta_for_scores(first, second, scores)? < ABA_CHAIN_MIN_DIFFERENT_DELTA_8BIT
+        || frame_signature_delta_for_scores(first, second, scores)? < pp.min_different_delta_8bit
     {
         return None;
     }
@@ -3688,8 +4033,8 @@ fn aba_chain_from_boundary(
         else {
             break;
         };
-        if same_as_previous_tag <= ABA_CHAIN_MAX_SIGNATURE_DELTA_8BIT
-            && different_from_previous >= ABA_CHAIN_MIN_DIFFERENT_DELTA_8BIT
+        if same_as_previous_tag <= pp.max_signature_delta_8bit
+            && different_from_previous >= pp.min_different_delta_8bit
         {
             chain.push(candidate);
         } else {
@@ -3697,7 +4042,7 @@ fn aba_chain_from_boundary(
         }
     }
 
-    if chain.len() - 1 < ABA_CHAIN_MIN_SEGMENTS {
+    if chain.len() - 1 < pp.min_segments {
         return None;
     }
 
@@ -3719,6 +4064,7 @@ fn aba_chain_from_boundary(
 }
 
 fn aba_chain_hidden_boundary(
+    pp: &AbaChainTuning,
     frame: usize,
     score: ScenecutResult,
     keyframes: &BTreeSet<usize>,
@@ -3735,17 +4081,17 @@ fn aba_chain_hidden_boundary(
     ) {
         return false;
     }
-    if score.cost_ratio < ABA_CHAIN_MIN_HIDDEN_COST_RATIO
-        || score.cost_ratio > ABA_CHAIN_MAX_HIDDEN_COST_RATIO
-        || score.imp_block_ratio < ABA_CHAIN_MIN_HIDDEN_IMP_RATIO
-        || score.global_imp_block_ratio < ABA_CHAIN_MIN_HIDDEN_GLOBAL_IMP_RATIO
-        || score.avg_luma_8bit > ABA_CHAIN_MAX_HIDDEN_LUMA_8BIT
-        || score.static_good_block_ratio > ABA_CHAIN_MAX_HIDDEN_GOOD_BLOCK_RATIO
+    if score.cost_ratio < pp.min_hidden_cost_ratio
+        || score.cost_ratio > pp.max_hidden_cost_ratio
+        || score.imp_block_ratio < pp.min_hidden_imp_ratio
+        || score.global_imp_block_ratio < pp.min_hidden_global_imp_ratio
+        || score.avg_luma_8bit > pp.max_hidden_luma_8bit
+        || score.static_good_block_ratio > pp.max_hidden_good_block_ratio
     {
         return false;
     }
     frame_signature_delta_for_scores(frame.saturating_sub(1), frame, scores)
-        .is_some_and(|delta| delta >= ABA_CHAIN_MIN_HIDDEN_EDGE_DELTA_8BIT)
+        .is_some_and(|delta| delta >= pp.min_hidden_edge_delta_8bit)
 }
 
 fn aba_chain_suppressible_cut(score: ScenecutResult) -> bool {
@@ -3755,30 +4101,24 @@ fn aba_chain_suppressible_cut(score: ScenecutResult) -> bool {
     )
 }
 
-const FORWARD_SIMILARITY_RECOVERY_MIN_MATCH_DELTA_8BIT: f64 = 8.0;
-const FORWARD_SIMILARITY_RECOVERY_MIN_COST_RATIO: f64 = 1.2;
-const FORWARD_SIMILARITY_RECOVERY_MIN_IMP_RATIO: f64 = 5.0;
-const FORWARD_SIMILARITY_RECOVERY_MIN_GLOBAL_IMP_RATIO: f64 = 6.0;
-const FORWARD_SIMILARITY_RECOVERY_MIN_EDGE_DELTA_8BIT: f64 = 20.0;
-const FORWARD_SIMILARITY_RECOVERY_MAX_FRAMES: usize = 3;
-
 fn apply_forward_similarity_recovery_postprocess(
     opts: DetectionOptions,
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
 ) {
+    let pp = &opts.tuning.postprocess.forward_similarity_recovery;
     let min_distance = opts.min_scenecut_distance.unwrap_or(0);
     let candidates = scores
         .iter()
         .filter_map(|(&frame, &score)| {
-            forward_similarity_recovery_candidate(frame, score, scores, min_distance)
+            forward_similarity_recovery_candidate(pp, frame, score, scores, min_distance)
         })
         .collect::<Vec<_>>();
 
     for mut frames in candidates {
         frames.sort_unstable();
         frames.dedup();
-        if frames.len() > FORWARD_SIMILARITY_RECOVERY_MAX_FRAMES
+        if frames.len() > pp.max_frames
             || !forward_similarity_recovery_distance_ok(&frames, keyframes, min_distance)
         {
             continue;
@@ -3793,14 +4133,15 @@ fn apply_forward_similarity_recovery_postprocess(
 }
 
 fn forward_similarity_recovery_candidate(
+    pp: &ForwardSimilarityRecoveryTuning,
     frame: usize,
     score: ScenecutResult,
     scores: &BTreeMap<usize, ScenecutResult>,
     min_distance: usize,
 ) -> Option<Vec<usize>> {
     if score.decision != ScenecutDecision::SuppressedForwardSimilarity
-        || score.forward_similarity_score? < FORWARD_SIMILARITY_RECOVERY_MIN_MATCH_DELTA_8BIT
-        || !forward_similarity_recovery_score(frame, score, scores)
+        || score.forward_similarity_score? < pp.min_match_delta_8bit
+        || !forward_similarity_recovery_score(pp, frame, score, scores)
     {
         return None;
     }
@@ -3818,7 +4159,7 @@ fn forward_similarity_recovery_candidate(
                 .copied()
                 .is_some_and(|candidate_score| {
                     candidate_score.decision == ScenecutDecision::SuppressedForwardSimilarity
-                        && forward_similarity_recovery_score(candidate, candidate_score, scores)
+                        && forward_similarity_recovery_score(pp, candidate, candidate_score, scores)
                 })
         })
         .collect::<Vec<_>>();
@@ -3833,15 +4174,16 @@ fn forward_similarity_recovery_candidate(
 }
 
 fn forward_similarity_recovery_score(
+    pp: &ForwardSimilarityRecoveryTuning,
     frame: usize,
     score: ScenecutResult,
     scores: &BTreeMap<usize, ScenecutResult>,
 ) -> bool {
-    score.cost_ratio >= FORWARD_SIMILARITY_RECOVERY_MIN_COST_RATIO
-        && score.imp_block_ratio >= FORWARD_SIMILARITY_RECOVERY_MIN_IMP_RATIO
-        && score.global_imp_block_ratio >= FORWARD_SIMILARITY_RECOVERY_MIN_GLOBAL_IMP_RATIO
+    score.cost_ratio >= pp.min_cost_ratio
+        && score.imp_block_ratio >= pp.min_imp_ratio
+        && score.global_imp_block_ratio >= pp.min_global_imp_ratio
         && frame_signature_delta_for_scores(frame.saturating_sub(1), frame, scores)
-            .is_some_and(|delta| delta >= FORWARD_SIMILARITY_RECOVERY_MIN_EDGE_DELTA_8BIT)
+            .is_some_and(|delta| delta >= pp.min_edge_delta_8bit)
 }
 
 fn forward_similarity_recovery_distance_ok(
@@ -3865,24 +4207,12 @@ struct BoundaryShiftCandidate {
     to: usize,
 }
 
-const TEXT_BOUNDARY_SHIFT_MIN_FORWARD_COST_RATIO: f64 = 1.0;
-const TEXT_BOUNDARY_SHIFT_MIN_FORWARD_IMP_RATIO: f64 = 8.0;
-const TEXT_BOUNDARY_SHIFT_MIN_FORWARD_GLOBAL_IMP_RATIO: f64 = 8.0;
-const TEXT_BOUNDARY_SHIFT_MAX_FORWARD_LUMA_8BIT: f64 = 40.0;
-const TEXT_BOUNDARY_SHIFT_MIN_FORWARD_BAD_BLOCK_RATIO: f64 = 0.75;
-const TEXT_BOUNDARY_SHIFT_MAX_FORWARD_GOOD_BLOCK_RATIO: f64 = 0.02;
-const TEXT_BOUNDARY_SHIFT_MIN_BACKWARD_IMP_RATIO: f64 = 4.5;
-const TEXT_BOUNDARY_SHIFT_MIN_BACKWARD_GLOBAL_IMP_RATIO: f64 = 8.0;
-const TEXT_BOUNDARY_SHIFT_MAX_BACKWARD_LUMA_8BIT: f64 = 35.0;
-const TEXT_BOUNDARY_SHIFT_MAX_NEXT_COST_RATIO: f64 = 1.0;
-const TEXT_BOUNDARY_SHIFT_MIN_NEXT_LUMA_8BIT: f64 = 45.0;
-const TEXT_BOUNDARY_SHIFT_MIN_GLOBAL_IMP_MARGIN: f64 = 1.0;
-
 fn apply_text_boundary_shift_postprocess(
     opts: DetectionOptions,
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
 ) {
+    let pp = &opts.tuning.postprocess.text_boundary_shift;
     let min_distance = opts.min_scenecut_distance.unwrap_or(0);
     if min_distance == 0 {
         return;
@@ -3891,7 +4221,7 @@ fn apply_text_boundary_shift_postprocess(
     let candidates = scores
         .iter()
         .filter_map(|(&frame, &score)| {
-            text_boundary_shift_candidate(frame, score, keyframes, scores, min_distance)
+            text_boundary_shift_candidate(pp, frame, score, keyframes, scores, min_distance)
         })
         .collect::<Vec<_>>();
 
@@ -3915,6 +4245,7 @@ fn apply_text_boundary_shift_postprocess(
 }
 
 fn text_boundary_shift_candidate(
+    pp: &TextBoundaryShiftTuning,
     frame: usize,
     score: ScenecutResult,
     keyframes: &BTreeSet<usize>,
@@ -3933,7 +4264,7 @@ fn text_boundary_shift_candidate(
     if previous_cut != 0
         && frame - previous_cut < min_distance
         && next_cut - frame >= min_distance
-        && text_boundary_forward_shift_score(score)
+        && text_boundary_forward_shift_score(pp, score)
     {
         return Some(BoundaryShiftCandidate {
             from: previous_cut,
@@ -3944,7 +4275,7 @@ fn text_boundary_shift_candidate(
     let next_score = scores.get(&next_cut).copied()?;
     if frame - previous_cut >= min_distance
         && next_cut - frame < min_distance
-        && text_boundary_backward_shift_score(score, next_score)
+        && text_boundary_backward_shift_score(pp, score, next_score)
     {
         return Some(BoundaryShiftCandidate {
             from: next_cut,
@@ -3955,61 +4286,58 @@ fn text_boundary_shift_candidate(
     None
 }
 
-fn text_boundary_forward_shift_score(score: ScenecutResult) -> bool {
+fn text_boundary_forward_shift_score(pp: &TextBoundaryShiftTuning, score: ScenecutResult) -> bool {
     score.decision == ScenecutDecision::SuppressedMinDistance
-        && score.cost_ratio >= TEXT_BOUNDARY_SHIFT_MIN_FORWARD_COST_RATIO
-        && score.imp_block_ratio >= TEXT_BOUNDARY_SHIFT_MIN_FORWARD_IMP_RATIO
-        && score.global_imp_block_ratio >= TEXT_BOUNDARY_SHIFT_MIN_FORWARD_GLOBAL_IMP_RATIO
-        && score.avg_luma_8bit <= TEXT_BOUNDARY_SHIFT_MAX_FORWARD_LUMA_8BIT
-        && score.static_bad_block_ratio >= TEXT_BOUNDARY_SHIFT_MIN_FORWARD_BAD_BLOCK_RATIO
-        && score.static_good_block_ratio <= TEXT_BOUNDARY_SHIFT_MAX_FORWARD_GOOD_BLOCK_RATIO
+        && score.cost_ratio >= pp.min_forward_cost_ratio
+        && score.imp_block_ratio >= pp.min_forward_imp_ratio
+        && score.global_imp_block_ratio >= pp.min_forward_global_imp_ratio
+        && score.avg_luma_8bit <= pp.max_forward_luma_8bit
+        && score.static_bad_block_ratio >= pp.min_forward_bad_block_ratio
+        && score.static_good_block_ratio <= pp.max_forward_good_block_ratio
 }
 
-fn text_boundary_backward_shift_score(score: ScenecutResult, next_score: ScenecutResult) -> bool {
+fn text_boundary_backward_shift_score(
+    pp: &TextBoundaryShiftTuning,
+    score: ScenecutResult,
+    next_score: ScenecutResult,
+) -> bool {
     matches!(
         score.decision,
         ScenecutDecision::NoCut
             | ScenecutDecision::SuppressedImportance
             | ScenecutDecision::SuppressedMinDistance
-    ) && score.imp_block_ratio >= TEXT_BOUNDARY_SHIFT_MIN_BACKWARD_IMP_RATIO
-        && score.global_imp_block_ratio >= TEXT_BOUNDARY_SHIFT_MIN_BACKWARD_GLOBAL_IMP_RATIO
-        && score.avg_luma_8bit <= TEXT_BOUNDARY_SHIFT_MAX_BACKWARD_LUMA_8BIT
-        && next_score.cost_ratio <= TEXT_BOUNDARY_SHIFT_MAX_NEXT_COST_RATIO
-        && next_score.avg_luma_8bit >= TEXT_BOUNDARY_SHIFT_MIN_NEXT_LUMA_8BIT
+    ) && score.imp_block_ratio >= pp.min_backward_imp_ratio
+        && score.global_imp_block_ratio >= pp.min_backward_global_imp_ratio
+        && score.avg_luma_8bit <= pp.max_backward_luma_8bit
+        && next_score.cost_ratio <= pp.max_next_cost_ratio
+        && next_score.avg_luma_8bit >= pp.min_next_luma_8bit
         && score.global_imp_block_ratio - next_score.global_imp_block_ratio
-            >= TEXT_BOUNDARY_SHIFT_MIN_GLOBAL_IMP_MARGIN
+            >= pp.min_global_imp_margin
 }
 
-const STATIC_CREDITS_MIN_RUN_CUTS: usize = 5;
-const STATIC_CREDITS_MAX_GAP: usize = 210;
-const STATIC_CREDITS_MAX_LUMA_8BIT: f64 = 45.0;
-const STATIC_CREDITS_MIN_IMP_RATIO: f64 = 6.0;
-const STATIC_CREDITS_MIN_GLOBAL_IMP_RATIO: f64 = 8.0;
-const STATIC_CREDITS_MIN_GOOD_BLOCK_RATIO: f64 = 0.35;
-const STATIC_CREDITS_MAX_BAD_BLOCK_RATIO: f64 = 0.65;
-
 fn apply_static_credits_postprocess(
+    pp: &StaticCreditsTuning,
     keyframes: &mut BTreeSet<usize>,
     scores: &mut BTreeMap<usize, ScenecutResult>,
 ) {
     suppress_predicate_runs(
         keyframes,
         scores,
-        static_credits_cut,
-        STATIC_CREDITS_MAX_GAP,
-        STATIC_CREDITS_MIN_RUN_CUTS,
+        |score| static_credits_cut(pp, score),
+        pp.max_gap,
+        pp.min_run_cuts,
         true,
         ScenecutDecision::SuppressedStaticCredits,
     );
 }
 
-fn static_credits_cut(score: ScenecutResult) -> bool {
+fn static_credits_cut(pp: &StaticCreditsTuning, score: ScenecutResult) -> bool {
     score.decision == ScenecutDecision::Cut
-        && score.avg_luma_8bit <= STATIC_CREDITS_MAX_LUMA_8BIT
-        && score.imp_block_ratio >= STATIC_CREDITS_MIN_IMP_RATIO
-        && score.global_imp_block_ratio >= STATIC_CREDITS_MIN_GLOBAL_IMP_RATIO
-        && score.static_good_block_ratio >= STATIC_CREDITS_MIN_GOOD_BLOCK_RATIO
-        && score.static_bad_block_ratio <= STATIC_CREDITS_MAX_BAD_BLOCK_RATIO
+        && score.avg_luma_8bit <= pp.max_luma_8bit
+        && score.imp_block_ratio >= pp.min_imp_ratio
+        && score.global_imp_block_ratio >= pp.min_global_imp_ratio
+        && score.static_good_block_ratio >= pp.min_good_block_ratio
+        && score.static_bad_block_ratio <= pp.max_bad_block_ratio
 }
 
 /// Specifies the scene detection algorithm to use
@@ -4161,6 +4489,271 @@ mod tests {
         score
     }
 
+    /// Baseline fog frame: importance far below any cut threshold, no cost.
+    fn fog_baseline_score(imp_block_cost: f64) -> ScenecutResult {
+        let mut score = score(ScenecutDecision::NoCut, 0.0, 0.3, 0.3, 50.0, None);
+        score.imp_block_cost = imp_block_cost;
+        score
+    }
+
+    /// Fog-cut peak: sharp local importance outlier with real fwd/bwd cost.
+    fn fog_peak_score(imp_block_cost: f64, avg_luma_8bit: f64) -> ScenecutResult {
+        let mut score = score(ScenecutDecision::NoCut, 0.3, 1.2, 1.4, avg_luma_8bit, None);
+        score.imp_block_cost = imp_block_cost;
+        score.backward_adjusted_cost = 0.3;
+        score
+    }
+
+    fn fog_scores(peaks: &[(usize, f64, f64)]) -> BTreeMap<usize, ScenecutResult> {
+        let mut scores = (100..=160)
+            .map(|frame| (frame, fog_baseline_score(100.0)))
+            .collect::<BTreeMap<_, _>>();
+        for &(frame, imp_block_cost, avg_luma_8bit) in peaks {
+            scores.insert(frame, fog_peak_score(imp_block_cost, avg_luma_8bit));
+        }
+        scores
+    }
+
+    #[test]
+    fn local_peak_recovery_recovers_fog_cut() {
+        let mut keyframes = BTreeSet::from([0, 60, 220]);
+        let mut scores = fog_scores(&[(130, 500.0, 52.0)]);
+
+        apply_local_peak_recovery_postprocess(
+            &PostprocessTuning::default().local_peak,
+            standard_options(),
+            &mut keyframes,
+            &mut scores,
+        );
+
+        assert_eq!(keyframes, BTreeSet::from([0, 60, 130, 220]));
+        assert_eq!(
+            scores.get(&130).map(|score| score.decision),
+            Some(ScenecutDecision::CutLocalPeak)
+        );
+    }
+
+    #[test]
+    fn local_peak_recovery_rejects_luma_jump() {
+        // Same peak but the average luma jumps by 30 (8-bit): a flash.
+        let mut keyframes = BTreeSet::from([0, 60, 220]);
+        let mut scores = fog_scores(&[(130, 500.0, 80.0)]);
+
+        apply_local_peak_recovery_postprocess(
+            &PostprocessTuning::default().local_peak,
+            standard_options(),
+            &mut keyframes,
+            &mut scores,
+        );
+
+        assert_eq!(keyframes, BTreeSet::from([0, 60, 220]));
+    }
+
+    #[test]
+    fn local_peak_recovery_requires_sharp_peak() {
+        // A ramp neighbor robs the peak of its 2x margin over neighbors.
+        let mut keyframes = BTreeSet::from([0, 60, 220]);
+        let mut scores = fog_scores(&[(130, 500.0, 52.0)]);
+        scores.insert(129, fog_baseline_score(300.0));
+
+        apply_local_peak_recovery_postprocess(
+            &PostprocessTuning::default().local_peak,
+            standard_options(),
+            &mut keyframes,
+            &mut scores,
+        );
+
+        assert_eq!(keyframes, BTreeSet::from([0, 60, 220]));
+    }
+
+    #[test]
+    fn local_peak_recovery_collapses_echo_to_earliest() {
+        // Two qualifying peaks 10 frames apart: only the earlier one lands.
+        let mut keyframes = BTreeSet::from([0, 60, 220]);
+        let mut scores = fog_scores(&[(130, 500.0, 52.0), (140, 600.0, 52.0)]);
+
+        apply_local_peak_recovery_postprocess(
+            &PostprocessTuning::default().local_peak,
+            standard_options(),
+            &mut keyframes,
+            &mut scores,
+        );
+
+        assert_eq!(keyframes, BTreeSet::from([0, 60, 130, 220]));
+    }
+
+    #[test]
+    fn local_peak_recovery_rejects_strobing_content() {
+        // Comparable peaks 8 frames to either side (letter-morph intro,
+        // lightning shimmer): two separate events => rhythmic, not a cut.
+        let mut keyframes = BTreeSet::from([0, 60, 220]);
+        let mut scores = fog_scores(&[(130, 500.0, 52.0)]);
+        scores.insert(122, fog_baseline_score(400.0));
+        scores.insert(138, fog_baseline_score(400.0));
+
+        apply_local_peak_recovery_postprocess(
+            &PostprocessTuning::default().local_peak,
+            standard_options(),
+            &mut keyframes,
+            &mut scores,
+        );
+
+        assert_eq!(keyframes, BTreeSet::from([0, 60, 220]));
+    }
+
+    #[test]
+    fn local_peak_recovery_tolerates_single_motion_swell() {
+        // One broad run of elevated frames (camera swell) merges into a
+        // single event and must not block the recovery.
+        let mut keyframes = BTreeSet::from([0, 60, 220]);
+        let mut scores = fog_scores(&[(130, 500.0, 52.0)]);
+        for frame in 140..=148 {
+            scores.insert(frame, fog_baseline_score(400.0));
+        }
+
+        apply_local_peak_recovery_postprocess(
+            &PostprocessTuning::default().local_peak,
+            standard_options(),
+            &mut keyframes,
+            &mut scores,
+        );
+
+        assert!(keyframes.contains(&130));
+    }
+
+    /// Good-gate victim: strong importance/cost, good ratio past the gate.
+    fn rescue_victim_score(signature: [u8; analyze::FRAME_LUMA_SIGNATURE_CELLS]) -> ScenecutResult {
+        let mut score = score(ScenecutDecision::NoCut, 0.4, 3.5, 3.8, 40.0, None);
+        score.imp_block_cost = 300.0;
+        score.static_good_block_ratio = 0.12;
+        score.frame_luma_signature = Some(signature);
+        score
+    }
+
+    fn rescue_scores(
+        candidate_signature: [u8; analyze::FRAME_LUMA_SIGNATURE_CELLS],
+        previous_signature: [u8; analyze::FRAME_LUMA_SIGNATURE_CELLS],
+    ) -> BTreeMap<usize, ScenecutResult> {
+        let mut scores = (100..=160)
+            .map(|frame| {
+                let mut base = fog_baseline_score(50.0);
+                base.frame_luma_signature = Some(previous_signature);
+                (frame, base)
+            })
+            .collect::<BTreeMap<_, _>>();
+        scores.insert(130, rescue_victim_score(candidate_signature));
+        scores
+    }
+
+    /// Half-bright/half-dark composition, and the same one mirrored.
+    fn split_signature(bright_first: bool) -> [u8; analyze::FRAME_LUMA_SIGNATURE_CELLS] {
+        let mut signature = [20u8; analyze::FRAME_LUMA_SIGNATURE_CELLS];
+        let cells = analyze::FRAME_LUMA_SIGNATURE_CELLS;
+        let (from, to) = if bright_first { (0, cells / 2) } else { (cells / 2, cells) };
+        signature[from..to].iter_mut().for_each(|cell| *cell = 120);
+        signature
+    }
+
+    #[test]
+    fn signature_rescue_recovers_composition_change() {
+        let mut keyframes = BTreeSet::from([0, 60, 220]);
+        let mut scores = rescue_scores(split_signature(false), split_signature(true));
+
+        apply_signature_rescue_postprocess(
+            &PostprocessTuning::default().signature_rescue,
+            standard_options(),
+            &mut keyframes,
+            &mut scores,
+        );
+
+        assert!(keyframes.contains(&130));
+        assert_eq!(
+            scores.get(&130).map(|score| score.decision),
+            Some(ScenecutDecision::CutSignatureRescue)
+        );
+    }
+
+    #[test]
+    fn signature_rescue_ignores_brightness_scaling() {
+        // Same composition, twice the brightness (flicker/flash): the
+        // normalized signatures match, so no rescue.
+        let dim = split_signature(true);
+        let mut bright = dim;
+        bright.iter_mut().for_each(|cell| *cell *= 2);
+        let mut keyframes = BTreeSet::from([0, 60, 220]);
+        let mut scores = rescue_scores(bright, dim);
+
+        apply_signature_rescue_postprocess(
+            &PostprocessTuning::default().signature_rescue,
+            standard_options(),
+            &mut keyframes,
+            &mut scores,
+        );
+
+        assert!(!keyframes.contains(&130));
+    }
+
+    #[test]
+    fn signature_rescue_rejects_matched_structure() {
+        // Composition moved (partial flash / occlusion) but most structure
+        // still correlates: not a cut.
+        let mut keyframes = BTreeSet::from([0, 60, 220]);
+        let mut scores = rescue_scores(split_signature(false), split_signature(true));
+        if let Some(score) = scores.get_mut(&130) {
+            score.structure_match_ratio = 0.85;
+            score.structure_coverage = 0.10;
+        }
+
+        apply_signature_rescue_postprocess(
+            &PostprocessTuning::default().signature_rescue,
+            standard_options(),
+            &mut keyframes,
+            &mut scores,
+        );
+
+        assert!(!keyframes.contains(&130));
+    }
+
+    #[test]
+    fn signature_rescue_rejects_strobing_content() {
+        let mut keyframes = BTreeSet::from([0, 60, 220]);
+        let mut scores = rescue_scores(split_signature(false), split_signature(true));
+        for frame in (110..=150).step_by(8) {
+            if frame != 130 {
+                scores.insert(frame, fog_baseline_score(250.0));
+            }
+        }
+
+        apply_signature_rescue_postprocess(
+            &PostprocessTuning::default().signature_rescue,
+            standard_options(),
+            &mut keyframes,
+            &mut scores,
+        );
+
+        assert!(!keyframes.contains(&130));
+    }
+
+    #[test]
+    fn local_peak_recovery_respects_cut_density() {
+        // Same qualifying peak, but the surrounding material is already cut
+        // every 20 frames: local statistics mean nothing there.
+        let mut keyframes = BTreeSet::from([0, 60, 220]);
+        for frame in (200..1000).step_by(20) {
+            keyframes.insert(frame);
+        }
+        let mut scores = fog_scores(&[(130, 500.0, 52.0)]);
+
+        apply_local_peak_recovery_postprocess(
+            &PostprocessTuning::default().local_peak,
+            standard_options(),
+            &mut keyframes,
+            &mut scores,
+        );
+
+        assert!(!keyframes.contains(&130));
+    }
+
     #[test]
     fn text_card_postprocess_suppresses_only_weak_runs() {
         let mut keyframes = BTreeSet::from([0, 100, 220, 244, 340, 520, 650]);
@@ -4216,7 +4809,7 @@ mod tests {
             ),
         ]);
 
-        apply_text_card_cluster_postprocess(&mut keyframes, &mut scores);
+        apply_text_card_cluster_postprocess(&PostprocessTuning::default().text_card, &mut keyframes, &mut scores);
 
         assert_eq!(keyframes, BTreeSet::from([0, 100, 520, 650]));
         for frame in [220, 244, 340] {
@@ -4278,7 +4871,7 @@ mod tests {
             ),
         ]);
 
-        apply_fast_motion_micro_split_postprocess(&mut keyframes, &mut scores);
+        apply_fast_motion_micro_split_postprocess(&PostprocessTuning::default().fast_motion, &mut keyframes, &mut scores);
 
         assert_eq!(keyframes, BTreeSet::from([0, 1000, 2326, 2600]));
         for frame in [2259, 2276] {
@@ -4404,7 +4997,7 @@ mod tests {
             (200, dark_occlusion_score(false)),
         ]);
 
-        apply_dark_occlusion_postprocess(&mut keyframes, &mut scores);
+        apply_dark_occlusion_postprocess(&PostprocessTuning::default().dark_occlusion, &mut keyframes, &mut scores);
 
         assert_eq!(keyframes, BTreeSet::from([0, 200]));
         assert_eq!(
@@ -4832,7 +5425,7 @@ mod tests {
             (900, score(ScenecutDecision::Cut, 2.0, 8.0, 8.5, 70.0, None)),
         ]);
 
-        apply_static_credits_postprocess(&mut keyframes, &mut scores);
+        apply_static_credits_postprocess(&PostprocessTuning::default().static_credits, &mut keyframes, &mut scores);
 
         assert_eq!(keyframes, BTreeSet::from([0, 100, 700, 797, 900]));
         for frame in [197, 294, 391, 488] {

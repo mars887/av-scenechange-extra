@@ -16,13 +16,16 @@ use v_frame::{
     plane::{Plane, PlaneGeometry},
 };
 
-use super::importance::{
-    IMP_BLOCK_MV_UNITS_PER_PIXEL,
-    IMP_BLOCK_SIZE_IN_MV_UNITS,
-    IMPORTANCE_BLOCK_SIZE,
-    ImportanceBlockDiff,
-    finalize_importance_block_diff,
-    importance_block_delta,
+use super::{
+    active::{ActiveRegion, detect_active_region},
+    importance::{
+        IMP_BLOCK_MV_UNITS_PER_PIXEL,
+        IMP_BLOCK_SIZE_IN_MV_UNITS,
+        IMPORTANCE_BLOCK_SIZE,
+        ImportanceBlockDiff,
+        finalize_importance_block_diff,
+        importance_block_delta,
+    },
 };
 use crate::{
     data::{
@@ -68,7 +71,7 @@ use crate::{
     math::{Fixed, ILog, clamp},
 };
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct InterCostEstimate {
     /// Zero-motion, appearance-change cost. This is the primary scene-cut cost.
     pub mean: f64,
@@ -79,6 +82,32 @@ pub struct InterCostEstimate {
     pub static_good_block_ratio: f64,
     pub me_bad_block_ratio: f64,
     pub me_good_block_ratio: f64,
+    /// `static_good_block_ratio` recomputed on DC-free block costs (SATD with
+    /// the per-block mean-brightness difference removed), against the same
+    /// full-cost good threshold. High on global flashes, near zero on cuts.
+    pub dc_free_good_block_ratio: f64,
+    /// Fraction of active blocks whose motion-compensated SATD drops below
+    /// the static good threshold once the per-block DC difference at the
+    /// chosen motion vector is removed. Only meaningful when
+    /// `motion_cost_computed`; measures how much structural change survives
+    /// the best motion + brightness compensation (flicker/flash/pans track,
+    /// real cuts do not).
+    pub me_dc_free_good_block_ratio: f64,
+    /// Mean of the DC-free motion-compensated block costs over the active
+    /// region. Only meaningful when `motion_cost_computed`.
+    pub me_dc_free_mean: f64,
+    /// Fraction of structure-bearing blocks whose zero-motion normalized
+    /// cross-correlation against the reference reaches the match threshold.
+    /// NCC is invariant to both brightness scaling and offset, and flat
+    /// (grain-only) blocks are excluded, so flashes/flicker score near 1.0
+    /// while real cuts score near 0 regardless of scene brightness.
+    pub structure_match_ratio: f64,
+    /// Fraction of active blocks that carry enough variance to be eligible
+    /// for structure matching; the match ratio is meaningless when this is
+    /// low (fog, near-black scenes).
+    pub structure_coverage: f64,
+    /// Non-bar picture region all means/ratios were aggregated over.
+    pub(crate) active_region: ActiveRegion,
 }
 
 /// Declares an array of motion vectors in structure of arrays syntax.
@@ -206,6 +235,7 @@ pub fn estimate_inter_costs<T: Pixel>(
         chroma_sampling,
         buffer,
     )
+    .0
     .mean
 }
 
@@ -219,8 +249,15 @@ pub fn estimate_static_inter_costs_detailed<T: Pixel>(
     ref_frame: &Arc<Frame<T>>,
     bit_depth: usize,
 ) -> InterCostEstimate {
-    let (mean, static_bad_block_ratio, static_good_block_ratio) =
-        estimate_static_inter_costs_from_planes(&frame.y_plane, &ref_frame.y_plane, bit_depth);
+    let (
+        mean,
+        static_bad_block_ratio,
+        static_good_block_ratio,
+        dc_free_good_block_ratio,
+        (structure_match_ratio, structure_coverage),
+        active_region,
+        _,
+    ) = estimate_static_inter_costs_from_planes(&frame.y_plane, &ref_frame.y_plane, bit_depth);
     InterCostEstimate {
         mean,
         motion_mean: mean,
@@ -229,6 +266,12 @@ pub fn estimate_static_inter_costs_detailed<T: Pixel>(
         static_good_block_ratio,
         me_bad_block_ratio: static_bad_block_ratio,
         me_good_block_ratio: static_good_block_ratio,
+        dc_free_good_block_ratio,
+        me_dc_free_good_block_ratio: 0.0,
+        me_dc_free_mean: 0.0,
+        structure_match_ratio,
+        structure_coverage,
+        active_region,
     }
 }
 
@@ -248,7 +291,7 @@ pub(crate) fn estimate_static_inter_and_importance_detailed<T: Pixel>(
     frame: &Arc<Frame<T>>,
     ref_frame: &Arc<Frame<T>>,
     bit_depth: usize,
-) -> (InterCostEstimate, ImportanceBlockDiff) {
+) -> (InterCostEstimate, ImportanceBlockDiff, Vec<f64>) {
     let plane_org = &frame.y_plane;
     let plane_ref = &ref_frame.y_plane;
     let h_in_imp_b = plane_org.height().get() / IMPORTANCE_BLOCK_SIZE;
@@ -256,11 +299,11 @@ pub(crate) fn estimate_static_inter_and_importance_detailed<T: Pixel>(
     let block_count = w_in_imp_b * h_in_imp_b;
     let bsize = BlockSize::from_width_and_height(IMPORTANCE_BLOCK_SIZE, IMPORTANCE_BLOCK_SIZE);
 
-    let mut inter_costs = 0u64;
     let mut block_costs = Vec::with_capacity(block_count);
-    let mut imp_block_costs = 0u64;
-    let mut luma_sum = 0i64;
     let mut imp_blocks = Vec::with_capacity(block_count);
+    let mut org_sums = Vec::with_capacity(block_count);
+    let mut ref_sums = Vec::with_capacity(block_count);
+    let mut moments = Vec::with_capacity(block_count);
 
     // Single row-major (y outer, x inner) pass: identical iteration order and
     // per-block math to both standalone functions.
@@ -286,23 +329,28 @@ pub(crate) fn estimate_static_inter_and_importance_detailed<T: Pixel>(
                 bsize.height(),
                 bit_depth,
             ) as u64;
-            inter_costs += block_cost;
             block_costs.push(block_cost as f64);
+            moments.push(block_second_moments(&region_org, &region_ref));
 
             // Importance half (same org/ref 8x8 tiles, now hot in cache).
-            let (delta, histogram_org_sum) = importance_block_delta(plane_org, plane_ref, x, y);
-            luma_sum += histogram_org_sum;
-            imp_block_costs += delta as u64;
+            let (delta, histogram_org_sum, histogram_ref_sum) =
+                importance_block_delta(plane_org, plane_ref, x, y);
+            org_sums.push(histogram_org_sum.max(0) as u64);
+            ref_sums.push(histogram_ref_sum.max(0) as u64);
             imp_blocks.push(delta as f64);
         });
     });
 
+    let active_region =
+        detect_active_region(&org_sums, &ref_sums, w_in_imp_b, h_in_imp_b, bit_depth);
+
     // Static finalize: identical to estimate_static_inter_costs_from_planes plus
     // the S2 InterCostEstimate shape. When block_count == 0 this yields the same
     // NaN mean/ratios as the unguarded standalone static path.
-    let mean = inter_costs as f64 / block_count as f64;
-    let (static_bad_block_ratio, static_good_block_ratio) =
-        block_cost_ratios(&block_costs, mean, block_count);
+    let (mean, static_bad_block_ratio, static_good_block_ratio) =
+        static_cost_stats(&block_costs, active_region);
+    let (structure_match_ratio, structure_coverage) =
+        structure_match_stats(&moments, &org_sums, &ref_sums, active_region, bit_depth);
     let inter = InterCostEstimate {
         mean,
         motion_mean: mean,
@@ -311,6 +359,18 @@ pub(crate) fn estimate_static_inter_and_importance_detailed<T: Pixel>(
         static_good_block_ratio,
         me_bad_block_ratio: static_bad_block_ratio,
         me_good_block_ratio: static_good_block_ratio,
+        dc_free_good_block_ratio: dc_free_good_ratio(
+            &block_costs,
+            &org_sums,
+            &ref_sums,
+            mean,
+            active_region,
+        ),
+        me_dc_free_good_block_ratio: 0.0,
+        me_dc_free_mean: 0.0,
+        structure_match_ratio,
+        structure_coverage,
+        active_region,
     };
 
     // Importance finalize: mirrors estimate_importance_block_difference_detailed,
@@ -322,19 +382,158 @@ pub(crate) fn estimate_static_inter_and_importance_detailed<T: Pixel>(
             blocks: Vec::new(),
             cols: 0,
             rows: 0,
+            active_region,
         }
     } else {
         finalize_importance_block_diff(
-            imp_block_costs,
-            luma_sum,
+            &org_sums,
             imp_blocks,
             w_in_imp_b,
             h_in_imp_b,
             bit_depth,
+            active_region,
         )
     };
 
-    (inter, importance)
+    (inter, importance, block_costs)
+}
+
+/// Per-block second moments for structure correlation: `(Σa², Σb², Σab)`.
+fn block_second_moments<T: Pixel>(
+    org: &PlaneRegion<'_, T>,
+    reference: &PlaneRegion<'_, T>,
+) -> (u64, u64, u64) {
+    let mut sum_aa = 0u64;
+    let mut sum_bb = 0u64;
+    let mut sum_ab = 0u64;
+    for (row_org, row_ref) in org
+        .rows_iter()
+        .zip(reference.rows_iter())
+        .take(IMPORTANCE_BLOCK_SIZE)
+    {
+        for (&a, &b) in row_org[..IMPORTANCE_BLOCK_SIZE]
+            .iter()
+            .zip(row_ref[..IMPORTANCE_BLOCK_SIZE].iter())
+        {
+            let a = u64::from(a.to_u16().expect("value should fit in u16"));
+            let b = u64::from(b.to_u16().expect("value should fit in u16"));
+            sum_aa += a * a;
+            sum_bb += b * b;
+            sum_ab += a * b;
+        }
+    }
+    (sum_aa, sum_bb, sum_ab)
+}
+
+/// Structure-match aggregation over the active region: the fraction of
+/// variance-bearing blocks whose normalized cross-correlation reaches 0.5,
+/// plus the fraction of blocks that qualified at all.
+///
+/// NCC is invariant to per-block brightness scaling AND offset, so a flash or
+/// flicker leaves matched structure at ~1.0 correlation while a real cut
+/// decorrelates it. Blocks below the variance floor (flat walls, fog, pure
+/// grain) carry no structure evidence either way and are excluded.
+fn structure_match_stats(
+    moments: &[(u64, u64, u64)],
+    org_sums: &[u64],
+    ref_sums: &[u64],
+    active_region: ActiveRegion,
+    bit_depth: usize,
+) -> (f64, f64) {
+    const PIXELS: f64 = (IMPORTANCE_BLOCK_SIZE * IMPORTANCE_BLOCK_SIZE) as f64;
+    let scale = f64::from(1u32 << (bit_depth - 8));
+    // A block must deviate by at least ~2 8-bit code values per pixel (in
+    // standard-deviation terms) to count as carrying structure.
+    let min_variance = PIXELS * (2.0 * scale) * (2.0 * scale);
+    const MIN_MATCH_CORRELATION: f64 = 0.5;
+
+    let mut eligible = 0usize;
+    let mut matched = 0usize;
+    for idx in active_region.indices() {
+        let (sum_aa, sum_bb, sum_ab) = moments[idx];
+        let sum_a = org_sums[idx] as f64;
+        let sum_b = ref_sums[idx] as f64;
+        let var_a = sum_aa as f64 - sum_a * sum_a / PIXELS;
+        let var_b = sum_bb as f64 - sum_b * sum_b / PIXELS;
+        if var_a < min_variance || var_b < min_variance {
+            continue;
+        }
+        eligible += 1;
+        let covariance = sum_ab as f64 - sum_a * sum_b / PIXELS;
+        if covariance >= MIN_MATCH_CORRELATION * (var_a * var_b).sqrt() {
+            matched += 1;
+        }
+    }
+    let active_count = active_region.count();
+    (
+        if eligible == 0 {
+            0.0
+        } else {
+            matched as f64 / eligible as f64
+        },
+        if active_count == 0 {
+            0.0
+        } else {
+            eligible as f64 / active_count as f64
+        },
+    )
+}
+
+/// Fraction of active blocks whose DC-free cost is below the good threshold
+/// derived from the full-cost mean.
+///
+/// The 8x8 SATD normalizes the summed Hadamard magnitudes by `>> 3`, and the
+/// transform's DC coefficient is the plain sum of pixel differences, so the DC
+/// contribution to a block's SATD is `|org_sum - ref_sum| / 8`. Subtracting it
+/// leaves the AC (structure) residual without a second transform pass.
+fn dc_free_good_ratio(
+    block_costs: &[f64],
+    org_sums: &[u64],
+    ref_sums: &[u64],
+    full_mean: f64,
+    active_region: ActiveRegion,
+) -> f64 {
+    let active_count = active_region.count();
+    if active_count == 0 || !full_mean.is_finite() {
+        return 0.0;
+    }
+    let good_threshold = full_mean * 0.25;
+    let good = active_region
+        .indices()
+        .filter(|&idx| {
+            let dc_part = org_sums[idx].abs_diff(ref_sums[idx]) as f64 / 8.0;
+            (block_costs[idx] - dc_part).max(0.0) <= good_threshold
+        })
+        .count();
+    good as f64 / active_count as f64
+}
+
+/// Mean and bad/good ratios of zero-motion block costs over the active region.
+///
+/// With a full-frame region this reproduces the historical whole-grid math
+/// exactly (including the NaN outputs on an empty grid); with bars detected it
+/// aggregates active blocks only, so bar blocks neither dilute the mean nor
+/// count as "good" (static) blocks.
+fn static_cost_stats(block_costs: &[f64], active_region: ActiveRegion) -> (f64, f64, f64) {
+    let active_count = active_region.count();
+    let mean = active_region.indices().map(|idx| block_costs[idx]).sum::<f64>()
+        / active_count as f64;
+    let bad_threshold = mean * 0.75;
+    let good_threshold = mean * 0.25;
+    let (bad, good) = active_region
+        .indices()
+        .fold((0usize, 0usize), |(bad, good), idx| {
+            let cost = block_costs[idx];
+            (
+                bad + usize::from(cost >= bad_threshold),
+                good + usize::from(cost <= good_threshold),
+            )
+        });
+    (
+        mean,
+        bad as f64 / active_count as f64,
+        good as f64 / active_count as f64,
+    )
 }
 
 pub fn estimate_inter_costs_detailed<T: Pixel>(
@@ -344,7 +543,7 @@ pub fn estimate_inter_costs_detailed<T: Pixel>(
     frame_rate: Rational32,
     chroma_sampling: ChromaSubsampling,
     buffer: RefMEStats,
-) -> InterCostEstimate {
+) -> (InterCostEstimate, Vec<f64>) {
     let bit_depth = NonZeroU8::new(bit_depth as u8).expect("bit depth must be non-zero");
     const REFERENCE_PADDING: usize = 160;
     let reference_frame = Arc::new(Frame {
@@ -411,15 +610,38 @@ pub fn estimate_inter_costs_detailed<T: Pixel>(
     // Estimate inter costs
     let plane_org = &frame.y_plane;
     let plane_ref = &reference_frame.y_plane;
-    let (mean, static_bad_block_ratio, static_good_block_ratio) =
-        estimate_static_inter_costs_from_planes(plane_org, plane_ref, bit_depth.get() as usize);
+    let (
+        mean,
+        static_bad_block_ratio,
+        static_good_block_ratio,
+        dc_free_good_block_ratio,
+        (structure_match_ratio, structure_coverage),
+        active_region,
+        static_block_costs,
+    ) = estimate_static_inter_costs_from_planes(plane_org, plane_ref, bit_depth.get() as usize);
     let h_in_imp_b = plane_org.height().get() / IMPORTANCE_BLOCK_SIZE;
     let w_in_imp_b = plane_org.width().get() / IMPORTANCE_BLOCK_SIZE;
     let stats = &fs.frame_me_stats.read().expect("poisoned lock")[0];
     let bsize = BlockSize::from_width_and_height(IMPORTANCE_BLOCK_SIZE, IMPORTANCE_BLOCK_SIZE);
 
-    let mut motion_inter_costs = 0;
-    let mut motion_block_costs = Vec::with_capacity(w_in_imp_b * h_in_imp_b);
+    // 8x8 pixel sum of a region (for the DC term at the chosen motion vector;
+    // the co-located `sum_8x8_block` cannot address MV-shifted blocks).
+    let region_sum = |region: &PlaneRegion<'_, T>| -> i64 {
+        region
+            .rows_iter()
+            .take(IMPORTANCE_BLOCK_SIZE)
+            .map(|row| {
+                row[..IMPORTANCE_BLOCK_SIZE]
+                    .iter()
+                    .map(|pixel| i64::from(pixel.to_u16().expect("value should fit in u16")))
+                    .sum::<i64>()
+            })
+            .sum()
+    };
+
+    let block_count = w_in_imp_b * h_in_imp_b;
+    let mut motion_block_costs = Vec::with_capacity(block_count);
+    let mut motion_ac_costs = Vec::with_capacity(block_count);
     (0..h_in_imp_b).for_each(|y| {
         (0..w_in_imp_b).for_each(|x| {
             let mv = stats[y * 2][x * 2].mv;
@@ -450,37 +672,73 @@ pub fn estimate_inter_costs_detailed<T: Pixel>(
                 bsize.height(),
                 bit_depth.get() as usize,
             ) as u64;
-            motion_inter_costs += motion_block_cost;
             motion_block_costs.push(motion_block_cost as f64);
+
+            // DC-free residual at the chosen MV: same identity as the static
+            // `dc_free_good_ratio` (8x8 SATD's DC term = |sum diff| / 8).
+            let dc_delta =
+                (region_sum(&region_org) - region_sum(&motion_region_ref)).unsigned_abs();
+            motion_ac_costs.push((motion_block_cost as f64 - dc_delta as f64 / 8.0).max(0.0));
         });
     });
 
-    let block_count = w_in_imp_b * h_in_imp_b;
-    let motion_mean = motion_inter_costs as f64 / block_count as f64;
-    let (me_bad_block_ratio, me_good_block_ratio) =
-        block_cost_ratios(&motion_block_costs, motion_mean, block_count);
+    let (motion_mean, me_bad_block_ratio, me_good_block_ratio) =
+        static_cost_stats(&motion_block_costs, active_region);
+    // Anchor the DC-free MC good threshold to the STATIC mean: the motion
+    // mean collapses on well-tracked pairs, which would make a self-relative
+    // threshold meaninglessly strict exactly where tracking succeeds.
+    let active_count = active_region.count();
+    let (me_dc_free_good_block_ratio, me_dc_free_mean) = if active_count == 0 || !mean.is_finite()
+    {
+        (0.0, 0.0)
+    } else {
+        let good_threshold = mean * 0.25;
+        let good = active_region
+            .indices()
+            .filter(|&idx| motion_ac_costs[idx] <= good_threshold)
+            .count();
+        let ac_mean = active_region
+            .indices()
+            .map(|idx| motion_ac_costs[idx])
+            .sum::<f64>()
+            / active_count as f64;
+        (good as f64 / active_count as f64, ac_mean)
+    };
 
-    InterCostEstimate {
-        mean,
-        motion_mean,
-        motion_cost_computed: true,
-        static_bad_block_ratio,
-        static_good_block_ratio,
-        me_bad_block_ratio,
-        me_good_block_ratio,
-    }
+    (
+        InterCostEstimate {
+            mean,
+            motion_mean,
+            motion_cost_computed: true,
+            static_bad_block_ratio,
+            static_good_block_ratio,
+            me_bad_block_ratio,
+            me_good_block_ratio,
+            dc_free_good_block_ratio,
+            me_dc_free_good_block_ratio,
+            me_dc_free_mean,
+            structure_match_ratio,
+            structure_coverage,
+            active_region,
+        },
+        static_block_costs,
+    )
 }
 
+#[expect(clippy::type_complexity)]
 fn estimate_static_inter_costs_from_planes<T: Pixel>(
     plane_org: &Plane<T>,
     plane_ref: &Plane<T>,
     bit_depth: usize,
-) -> (f64, f64, f64) {
+) -> (f64, f64, f64, f64, (f64, f64), ActiveRegion, Vec<f64>) {
     let h_in_imp_b = plane_org.height().get() / IMPORTANCE_BLOCK_SIZE;
     let w_in_imp_b = plane_org.width().get() / IMPORTANCE_BLOCK_SIZE;
     let bsize = BlockSize::from_width_and_height(IMPORTANCE_BLOCK_SIZE, IMPORTANCE_BLOCK_SIZE);
-    let mut inter_costs = 0;
-    let mut block_costs = Vec::with_capacity(w_in_imp_b * h_in_imp_b);
+    let block_count = w_in_imp_b * h_in_imp_b;
+    let mut block_costs = Vec::with_capacity(block_count);
+    let mut org_sums = Vec::with_capacity(block_count);
+    let mut ref_sums = Vec::with_capacity(block_count);
+    let mut moments = Vec::with_capacity(block_count);
     (0..h_in_imp_b).for_each(|y| {
         (0..w_in_imp_b).for_each(|x| {
             let region_org = plane_org.region(Area::Rect(Rect {
@@ -502,31 +760,33 @@ fn estimate_static_inter_costs_from_planes<T: Pixel>(
                 bsize.height(),
                 bit_depth,
             ) as u64;
-            inter_costs += block_cost;
             block_costs.push(block_cost as f64);
+            moments.push(block_second_moments(&region_org, &region_ref));
+
+            let (_, histogram_org_sum, histogram_ref_sum) =
+                importance_block_delta(plane_org, plane_ref, x, y);
+            org_sums.push(histogram_org_sum.max(0) as u64);
+            ref_sums.push(histogram_ref_sum.max(0) as u64);
         });
     });
 
-    let block_count = w_in_imp_b * h_in_imp_b;
-    let mean = inter_costs as f64 / block_count as f64;
-    let (bad_block_ratio, good_block_ratio) = block_cost_ratios(&block_costs, mean, block_count);
-    (mean, bad_block_ratio, good_block_ratio)
-}
-
-fn block_cost_ratios(block_costs: &[f64], mean: f64, block_count: usize) -> (f64, f64) {
-    let bad_threshold = mean * 0.75;
-    let good_threshold = mean * 0.25;
-    let bad_block_ratio = block_costs
-        .iter()
-        .filter(|&&cost| cost >= bad_threshold)
-        .count() as f64
-        / block_count as f64;
-    let good_block_ratio = block_costs
-        .iter()
-        .filter(|&&cost| cost <= good_threshold)
-        .count() as f64
-        / block_count as f64;
-    (bad_block_ratio, good_block_ratio)
+    let active_region =
+        detect_active_region(&org_sums, &ref_sums, w_in_imp_b, h_in_imp_b, bit_depth);
+    let (mean, bad_block_ratio, good_block_ratio) =
+        static_cost_stats(&block_costs, active_region);
+    let dc_free_good =
+        dc_free_good_ratio(&block_costs, &org_sums, &ref_sums, mean, active_region);
+    let structure =
+        structure_match_stats(&moments, &org_sums, &ref_sums, active_region, bit_depth);
+    (
+        mean,
+        bad_block_ratio,
+        good_block_ratio,
+        dc_free_good,
+        structure,
+        active_region,
+        block_costs,
+    )
 }
 
 #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -2005,15 +2265,15 @@ mod tests {
         let zero_motion_mean = estimate_static_inter_costs_detailed(&current, &reference, 8).mean;
 
         assert!(
-            estimate.motion_mean < zero_motion_mean * 0.75,
+            estimate.0.motion_mean < zero_motion_mean * 0.75,
             "motion-estimated mean {} should be substantially below zero-motion mean {}",
-            estimate.motion_mean,
+            estimate.0.motion_mean,
             zero_motion_mean
         );
         assert!(
-            (estimate.mean - zero_motion_mean).abs() < f64::EPSILON,
+            (estimate.0.mean - zero_motion_mean).abs() < f64::EPSILON,
             "primary scene-cut mean {} should preserve zero-motion appearance cost {}",
-            estimate.mean,
+            estimate.0.mean,
             zero_motion_mean
         );
     }
@@ -2038,7 +2298,7 @@ mod tests {
 
         let want_inter = estimate_static_inter_costs_detailed(org, reff, 8);
         let want_imp = estimate_importance_block_difference_detailed(org, reff, 8);
-        let (got_inter, got_imp) = estimate_static_inter_and_importance_detailed(org, reff, 8);
+        let (got_inter, got_imp, _) = estimate_static_inter_and_importance_detailed(org, reff, 8);
 
         // Bit-exact, NaN-aware (the degenerate 0-block case yields NaN means).
         let eqf = |a: f64, b: f64| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan());
@@ -2070,6 +2330,21 @@ mod tests {
             eqf(got_inter.me_good_block_ratio, want_inter.me_good_block_ratio),
             "me_good_block_ratio"
         );
+        assert!(
+            eqf(
+                got_inter.dc_free_good_block_ratio,
+                want_inter.dc_free_good_block_ratio
+            ),
+            "dc_free_good_block_ratio"
+        );
+        assert!(
+            eqf(got_inter.structure_match_ratio, want_inter.structure_match_ratio),
+            "structure_match_ratio"
+        );
+        assert!(
+            eqf(got_inter.structure_coverage, want_inter.structure_coverage),
+            "structure_coverage"
+        );
 
         assert!(eqf(got_imp.mean, want_imp.mean), "imp.mean");
         assert!(
@@ -2091,6 +2366,87 @@ mod tests {
         let org = shifted_block_frame(36);
         let reference = shifted_block_frame(28);
         assert_fused_matches_separate(&org, &reference);
+    }
+
+    fn striped_frame(vertical: bool, offset: u8) -> Arc<Frame<u8>> {
+        let mut frame = FrameBuilder::new(
+            NonZeroUsize::new(128).expect("non-zero width"),
+            NonZeroUsize::new(128).expect("non-zero height"),
+            ChromaSubsampling::Monochrome,
+            NonZeroU8::new(8).expect("non-zero bit depth"),
+        )
+        .build()
+        .expect("test frame should build");
+        for (y, row) in frame.y_plane.rows_mut().enumerate() {
+            for (x, pixel) in row.iter_mut().enumerate() {
+                let coord = if vertical { x } else { y };
+                *pixel = if coord % 2 == 0 { 60 } else { 140 } + offset;
+            }
+        }
+        Arc::new(frame)
+    }
+
+    #[test]
+    fn structure_match_high_on_flash_low_on_structure_change() {
+        let base = striped_frame(false, 0);
+
+        // Additive flash: same structure, +40 brightness.
+        let flashed = striped_frame(false, 40);
+        let (flash, _, _) = estimate_static_inter_and_importance_detailed(&flashed, &base, 8);
+        assert!(
+            flash.structure_match_ratio > 0.99 && flash.structure_coverage > 0.99,
+            "flash should keep correlated structure, got match={} coverage={}",
+            flash.structure_match_ratio,
+            flash.structure_coverage
+        );
+
+        // Orthogonal structure at the same mean brightness: decorrelated.
+        let rotated = striped_frame(true, 0);
+        let (cut, _, _) = estimate_static_inter_and_importance_detailed(&rotated, &base, 8);
+        assert!(
+            cut.structure_match_ratio < 0.01,
+            "structure change should decorrelate, got {}",
+            cut.structure_match_ratio
+        );
+
+        // Flat frames carry no structure evidence at all.
+        let flat_a = solid_frame(128, 128, 60);
+        let flat_b = solid_frame(128, 128, 100);
+        let (flat, _, _) = estimate_static_inter_and_importance_detailed(&flat_b, &flat_a, 8);
+        assert!(
+            flat.structure_coverage < 0.01,
+            "flat frames should not qualify, got coverage {}",
+            flat.structure_coverage
+        );
+    }
+
+    #[test]
+    fn dc_free_good_ratio_high_on_flash_low_on_structure_change() {
+        // Same structure, +40 global brightness: every block's SATD is pure
+        // DC, so removing the DC leaves perfectly matching blocks.
+        let base = striped_frame(false, 0);
+        let flashed = striped_frame(false, 40);
+        let (flash_inter, _, _) = estimate_static_inter_and_importance_detailed(&flashed, &base, 8);
+        assert!(
+            flash_inter.dc_free_good_block_ratio > 0.99,
+            "flash should look static after DC removal, got {}",
+            flash_inter.dc_free_good_block_ratio
+        );
+        assert!(
+            flash_inter.static_good_block_ratio < 0.01,
+            "flash still shows raw appearance change, got {}",
+            flash_inter.static_good_block_ratio
+        );
+
+        // Same mean brightness, orthogonal structure: DC removal must not
+        // rescue a real content change.
+        let rotated = striped_frame(true, 0);
+        let (cut_inter, _, _) = estimate_static_inter_and_importance_detailed(&rotated, &base, 8);
+        assert!(
+            cut_inter.dc_free_good_block_ratio < 0.01,
+            "structure change should stay bad after DC removal, got {}",
+            cut_inter.dc_free_good_block_ratio
+        );
     }
 
     #[test]

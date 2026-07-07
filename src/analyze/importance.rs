@@ -6,7 +6,10 @@ use std::sync::Arc;
 use cfg_if::cfg_if;
 use v_frame::{frame::Frame, pixel::Pixel, plane::Plane};
 
-use super::intra::BLOCK_TO_PLANE_SHIFT;
+use super::{
+    active::{ActiveRegion, detect_active_region},
+    intra::BLOCK_TO_PLANE_SHIFT,
+};
 
 /// Size of blocks for the importance computation, in pixels.
 pub const IMPORTANCE_BLOCK_SIZE: usize =
@@ -23,6 +26,7 @@ pub(crate) struct ImportanceBlockDiff {
     pub blocks: Vec<f64>,
     pub cols: usize,
     pub rows: usize,
+    pub active_region: ActiveRegion,
 }
 
 #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -54,29 +58,33 @@ pub(crate) fn estimate_importance_block_difference_detailed<T: Pixel>(
             blocks: Vec::new(),
             cols: 0,
             rows: 0,
+            active_region: ActiveRegion::full(0, 0),
         };
     }
 
-    let mut imp_block_costs = 0u64;
-    let mut luma_sum = 0i64;
     let mut blocks = Vec::with_capacity(block_count);
+    let mut org_sums = Vec::with_capacity(block_count);
+    let mut ref_sums = Vec::with_capacity(block_count);
 
     (0..h_in_imp_b).for_each(|y| {
         (0..w_in_imp_b).for_each(|x| {
-            let (delta, histogram_org_sum) = importance_block_delta(plane_org, plane_ref, x, y);
-            luma_sum += histogram_org_sum;
-            imp_block_costs += delta as u64;
+            let (delta, histogram_org_sum, histogram_ref_sum) =
+                importance_block_delta(plane_org, plane_ref, x, y);
+            org_sums.push(histogram_org_sum.max(0) as u64);
+            ref_sums.push(histogram_ref_sum.max(0) as u64);
             blocks.push(delta as f64);
         });
     });
 
+    let active_region =
+        detect_active_region(&org_sums, &ref_sums, w_in_imp_b, h_in_imp_b, bit_depth);
     finalize_importance_block_diff(
-        imp_block_costs,
-        luma_sum,
+        &org_sums,
         blocks,
         w_in_imp_b,
         h_in_imp_b,
         bit_depth,
+        active_region,
     )
 }
 
@@ -85,15 +93,16 @@ pub(crate) fn estimate_importance_block_difference_detailed<T: Pixel>(
 /// Shared by [`estimate_importance_block_difference_detailed`] and the fused
 /// static+importance traversal in `super::inter`, so the integer rounding lives
 /// in one place and cannot drift between the two callers. Returns
-/// `(per_block_abs_mean_delta, org_block_sum)`; the caller accumulates
-/// `org_block_sum` into the luma total (org-only, matching the original).
+/// `(per_block_abs_mean_delta, org_block_sum, ref_block_sum)`; the caller
+/// accumulates `org_block_sum` into the luma total (org-only, matching the
+/// original) and feeds both sums to letterbox detection.
 #[inline]
 pub(crate) fn importance_block_delta<T: Pixel>(
     plane_org: &Plane<T>,
     plane_ref: &Plane<T>,
     x: usize,
     y: usize,
-) -> (i64, i64) {
+) -> (i64, i64, i64) {
     let histogram_org_sum = sum_8x8_block(plane_org, x, y);
     let histogram_ref_sum = sum_8x8_block(plane_ref, x, y);
 
@@ -102,25 +111,35 @@ pub(crate) fn importance_block_delta<T: Pixel>(
         - ((histogram_ref_sum + count / 2) / count))
         .abs();
 
-    (mean, histogram_org_sum)
+    (mean, histogram_org_sum, histogram_ref_sum)
 }
 
 /// Finalizes importance accumulators into an [`ImportanceBlockDiff`]. Shared by
 /// the standalone importance pass and the fused static+importance pass.
 ///
+/// The mean delta and average luma are aggregated over `active_region` only,
+/// so letterbox bars do not dilute them; `blocks` keeps the full grid because
+/// downstream top-block masks need the complete geometry (bar blocks carry
+/// zero delta and are never selected).
+///
 /// Callers must guarantee `w_in_imp_b * h_in_imp_b != 0`; the empty-grid case is
 /// handled before any accumulation.
 pub(crate) fn finalize_importance_block_diff(
-    imp_block_costs: u64,
-    luma_sum: i64,
+    org_sums: &[u64],
     blocks: Vec<f64>,
     w_in_imp_b: usize,
     h_in_imp_b: usize,
     bit_depth: usize,
+    active_region: ActiveRegion,
 ) -> ImportanceBlockDiff {
-    let block_count = w_in_imp_b * h_in_imp_b;
+    let active_count = active_region.count();
     let sample_max = 2.0_f64.powi(bit_depth as i32) - 1.0;
-    let pixel_count = (block_count * IMPORTANCE_BLOCK_SIZE * IMPORTANCE_BLOCK_SIZE) as f64;
+    let pixel_count = (active_count * IMPORTANCE_BLOCK_SIZE * IMPORTANCE_BLOCK_SIZE) as f64;
+    let (imp_block_costs, luma_sum) = active_region
+        .indices()
+        .fold((0.0_f64, 0u64), |(costs, luma), idx| {
+            (costs + blocks[idx], luma + org_sums[idx])
+        });
     let avg_luma_8bit = if sample_max > 0.0 && pixel_count > 0.0 {
         (luma_sum as f64 / pixel_count) * 255.0 / sample_max
     } else {
@@ -128,11 +147,16 @@ pub(crate) fn finalize_importance_block_diff(
     };
 
     ImportanceBlockDiff {
-        mean: imp_block_costs as f64 / block_count as f64,
+        mean: if active_count == 0 {
+            0.0
+        } else {
+            imp_block_costs / active_count as f64
+        },
         avg_luma_8bit,
         blocks,
         cols: w_in_imp_b,
         rows: h_in_imp_b,
+        active_region,
     }
 }
 

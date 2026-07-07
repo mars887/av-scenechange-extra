@@ -26,6 +26,7 @@ use crate::{
     },
 };
 
+mod active;
 mod fast;
 mod importance;
 mod inter;
@@ -924,8 +925,13 @@ impl<T: Pixel> SceneChangeDetector<T> {
         {
             return false;
         }
-        if self.tuning.importance_cut_max_me_good_ratio > 0.0
-            && current.static_good_block_ratio > self.tuning.importance_cut_max_me_good_ratio
+        let good_gate_applies = {
+            let skip_from = self.tuning.importance_cut_good_gate_max_cost_ratio;
+            skip_from <= 0.0 || current.cost_ratio < skip_from
+        };
+        if good_gate_applies
+            && self.tuning.importance_cut_max_me_good_ratio > 0.0
+            && current.textured_good_block_ratio > self.tuning.importance_cut_max_me_good_ratio
         {
             return false;
         }
@@ -936,13 +942,25 @@ impl<T: Pixel> SceneChangeDetector<T> {
             return false;
         }
 
-        let strict_passed = current.imp_block_ratio >= min_ratio
+        let mut strict_need = self.bright_adapted_ratio(current.avg_luma_8bit, min_ratio);
+        // Near-threshold whole-frame cost trades off against importance
+        // evidence: relieve the strict requirement as the cost ratio
+        // approaches the cut threshold.
+        let cr_slope = self.tuning.importance_cut_strict_ratio_cr_slope;
+        let cr_anchor = self.tuning.importance_cut_good_gate_max_cost_ratio;
+        if cr_slope > 0.0 && cr_anchor > 0.0 && current.cost_ratio > cr_anchor {
+            strict_need = (strict_need
+                - cr_slope * (current.cost_ratio.min(1.0) - cr_anchor))
+                .max(self.tuning.importance_cut_dark_min_ratio);
+        }
+        let strict_passed = current.imp_block_ratio >= strict_need
             && current.cost_ratio >= self.tuning.importance_cut_min_cost_ratio;
         let relaxed_passed = self
             .tuning
             .importance_cut_relaxed_ratio
             .is_some_and(|ratio| {
                 let ratio = self.dark_adapted_relaxed_ratio(current.avg_luma_8bit, ratio);
+                let ratio = self.bright_adapted_ratio(current.avg_luma_8bit, ratio);
                 let previous_ratio = self
                     .score_deque
                     .get(index + 1)
@@ -950,8 +968,18 @@ impl<T: Pixel> SceneChangeDetector<T> {
                 let spatial_passed = current.imp_block_ratio >= ratio;
                 let global_passed = current.global_imp_block_ratio >= ratio + 0.35
                     && current.imp_block_ratio >= ratio * 0.75;
+                // A cut into high motion min-subtracts the forward cost to
+                // ~0; a strong importance peak plus substantial backward
+                // cost is accepted as the cost evidence instead.
+                let backward_min_cr = self.tuning.importance_cut_backward_min_cost_ratio;
+                let cost_evidence = current.cost_ratio
+                    >= self.tuning.importance_cut_relaxed_min_cost_ratio
+                    || (backward_min_cr > 0.0
+                        && current.imp_block_ratio
+                            >= self.tuning.importance_cut_backward_min_imp_ratio
+                        && current.backward_adjusted_cost >= backward_min_cr * current.threshold);
                 (spatial_passed || global_passed)
-                    && current.cost_ratio >= self.tuning.importance_cut_relaxed_min_cost_ratio
+                    && cost_evidence
                     && previous_ratio <= self.tuning.importance_cut_relaxed_max_previous_ratio
                     && current.static_bad_block_ratio >= self.tuning.importance_cut_min_me_bad_ratio
             });
@@ -1072,6 +1100,19 @@ impl<T: Pixel> SceneChangeDetector<T> {
         );
         (base_ratio - self.tuning.importance_cut_dark_ratio_boost * darkness)
             .max(self.tuning.importance_cut_dark_min_ratio)
+    }
+
+    /// Continuation of the luma adaptation above
+    /// `importance_cut_dark_luma_high_8bit`: the required importance ratio
+    /// rises by `importance_cut_bright_ratio_slope` per 60 8-bit luma of extra
+    /// brightness, mirroring how the dark side lowers it below the window.
+    fn bright_adapted_ratio(&self, avg_luma_8bit: f64, base_ratio: f64) -> f64 {
+        let slope = self.tuning.importance_cut_bright_ratio_slope;
+        let luma_high = self.tuning.importance_cut_dark_luma_high_8bit;
+        if slope <= 0.0 || avg_luma_8bit <= luma_high {
+            return base_ratio;
+        }
+        base_ratio + slope * (avg_luma_8bit - luma_high) / 60.0
     }
 
     fn temporal_top_importance_score(
@@ -2013,10 +2054,18 @@ fn forward_prefilter_masked_mean(bounds: &mut [f64], keep: usize) -> f64 {
 pub(crate) fn frame_luma_signature_8bit<T: Pixel>(
     frame: &Frame<T>,
     bit_depth: usize,
+    active_rect: Option<(usize, usize, usize, usize)>,
 ) -> [u8; FRAME_LUMA_SIGNATURE_CELLS] {
     let plane = &frame.y_plane;
     let width = plane.width().get();
     let height = plane.height().get();
+    // Sample the signature grid over the active (non-bar) picture rect only:
+    // letterbox bars compress every cell mean towards black, which makes
+    // signatures of unrelated bared shots spuriously similar and breaks the
+    // signature-based passes (A-B-A chains, refined peaks, boundary shifts).
+    let (active_x0, active_x1, active_y0, active_y1) =
+        active_rect.unwrap_or((0, width, 0, height));
+    let (active_width, active_height) = (active_x1 - active_x0, active_y1 - active_y0);
     let stride = plane.geometry().stride.get();
     let origin = plane.data_origin();
     let data = plane.data();
@@ -2025,11 +2074,11 @@ pub(crate) fn frame_luma_signature_8bit<T: Pixel>(
     let mut cell_idx = 0;
 
     for cell_y in 0..FRAME_LUMA_SIGNATURE_ROWS {
-        let y0 = cell_y * height / FRAME_LUMA_SIGNATURE_ROWS;
-        let y1 = (cell_y + 1) * height / FRAME_LUMA_SIGNATURE_ROWS;
+        let y0 = active_y0 + cell_y * active_height / FRAME_LUMA_SIGNATURE_ROWS;
+        let y1 = active_y0 + (cell_y + 1) * active_height / FRAME_LUMA_SIGNATURE_ROWS;
         for cell_x in 0..FRAME_LUMA_SIGNATURE_COLS {
-            let x0 = cell_x * width / FRAME_LUMA_SIGNATURE_COLS;
-            let x1 = (cell_x + 1) * width / FRAME_LUMA_SIGNATURE_COLS;
+            let x0 = active_x0 + cell_x * active_width / FRAME_LUMA_SIGNATURE_COLS;
+            let x1 = active_x0 + (cell_x + 1) * active_width / FRAME_LUMA_SIGNATURE_COLS;
             let mut sum = 0u64;
 
             for sample_y in 0..FRAME_LUMA_SIGNATURE_SAMPLES_PER_CELL {
@@ -2826,6 +2875,11 @@ fn usize_is_zero(value: &usize) -> bool {
     *value == 0
 }
 
+#[cfg(feature = "serialize")]
+const fn default_active_fraction() -> f64 {
+    1.0
+}
+
 fn sort_forward_similarity_candidates(
     candidates: &mut [Option<ForwardSimilarityCandidate>; FORWARD_SIMILARITY_DIAGNOSTIC_SLOTS],
 ) {
@@ -2954,6 +3008,9 @@ pub enum ScenecutDecision {
     CutAbaReturn,
     SuppressedAbaChain,
     CutForwardSimilarityRecovery,
+    SuppressedMicroScene,
+    CutLocalPeak,
+    CutSignatureRescue,
 }
 
 /// Contains the scores for scenecut analysis on a single frame
@@ -2982,6 +3039,50 @@ pub struct ScenecutResult {
     pub static_good_block_ratio: f64,
     pub me_bad_block_ratio: f64,
     pub me_good_block_ratio: f64,
+    /// `static_good_block_ratio` restricted to textured blocks (per-block
+    /// intra cost at least `importance_cut_good_block_min_intra_ratio` of the
+    /// frame mean); equals `static_good_block_ratio` when that option is
+    /// disabled. Flat blocks match across any cut, so only textured matches
+    /// count as tracking evidence for the importance-cut good-block gate.
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub textured_good_block_ratio: f64,
+    /// Fraction of active blocks whose static SATD falls below the good-block
+    /// threshold once the per-block DC (mean brightness) difference is
+    /// removed. A global flash shifts every block's DC while leaving structure
+    /// intact, so this stays high on flashes and near zero across real cuts.
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub dc_free_good_block_ratio: f64,
+    /// Motion-compensated variant of `dc_free_good_block_ratio`: fraction of
+    /// active blocks matching after the best motion vector AND the DC
+    /// difference at that vector are compensated. Only meaningful when
+    /// `motion_cost_computed`.
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub me_dc_free_good_block_ratio: f64,
+    /// Mean DC-free motion-compensated block cost over the active region.
+    /// Only meaningful when `motion_cost_computed`.
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub me_dc_free_cost: f64,
+    /// Fraction of structure-bearing blocks whose zero-motion normalized
+    /// cross-correlation reaches the match threshold: brightness-invariant
+    /// structure tracking (flash/flicker ~1.0, real cut ~0).
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub structure_match_ratio: f64,
+    /// Fraction of active blocks eligible for structure matching; the match
+    /// ratio is unreliable when this is low.
+    #[cfg_attr(feature = "serialize", serde(default))]
+    pub structure_coverage: f64,
+    /// Fraction of the block grid inside the detected active (non-bar) picture
+    /// region this frame's metrics were aggregated over; `1.0` when no
+    /// letterbox/pillarbox bars were detected.
+    #[cfg_attr(feature = "serialize", serde(default = "default_active_fraction"))]
+    pub active_block_fraction: f64,
+    /// Detected bar sizes in block units as `[top, bottom, left, right]`;
+    /// `None` when the frame has no bars.
+    #[cfg_attr(
+        feature = "serialize",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub active_crop: Option<[usize; 4]>,
     #[cfg_attr(
         feature = "serialize",
         serde(default, skip_serializing_if = "Option::is_none")
@@ -3035,6 +3136,14 @@ impl ScenecutResult {
             static_good_block_ratio: 0.0,
             me_bad_block_ratio: 0.0,
             me_good_block_ratio: 0.0,
+            textured_good_block_ratio: 0.0,
+            dc_free_good_block_ratio: 0.0,
+            me_dc_free_good_block_ratio: 0.0,
+            me_dc_free_cost: 0.0,
+            structure_match_ratio: 0.0,
+            structure_coverage: 0.0,
+            active_block_fraction: 1.0,
+            active_crop: None,
             frame_luma_signature: None,
             transient_similarity_score: None,
             forward_similarity_score: None,
